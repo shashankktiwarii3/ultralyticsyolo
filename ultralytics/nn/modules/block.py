@@ -2159,3 +2159,39 @@ class FASA(nn.Module):
         a     = a_c * (g * a_s + (1 - g))
         alpha = self.alpha.to(dt)
         return x * (1 + alpha * (2 * a - 1))
+
+
+class CoordinationAttention(nn.Module):
+    def __init__(self, c1, c2, reduction=32):
+        super().__init__()
+        assert c1 == c2, f"CoordinationAttention requires c1==c2, got {c1} vs {c2}"
+
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, c1 // reduction)
+
+        self.conv1 = nn.Conv2d(c1, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.SiLU()
+
+        self.conv_h = nn.Conv2d(mip, c1, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, c1, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        b, c, h, w = x.size()
+
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        return identity * a_h * a_w
