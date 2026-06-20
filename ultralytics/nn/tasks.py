@@ -1638,7 +1638,10 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+        if m in {WGCA, LKA,  WCA, MDC}:
+            c1 = c2 = ch[f]              # channel-preserving
+            args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
+        elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1664,9 +1667,7 @@ def parse_model(d, ch, verbose=True):
             c1 = c2 = ch[f]
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
-        elif m in {WGCA, LKA,  WCA, MDC}:
-            c1 = c2 = ch[f]              # channel-preserving
-            args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
+        
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):
