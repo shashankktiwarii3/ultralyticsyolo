@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import FASA, CoordinationAttention
+from ultralytics.nn.modules.block import FASA,WGCA, LKA, CoordinationAttention
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1602,7 +1602,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            FASA, CoordinationAttention
+            FASA,WGCA, LKA, CoordinationAttention
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1622,7 +1622,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            FASA, CoordinationAttention
+            FASA,WGCA, LKA, CoordinationAttention
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1663,6 +1663,10 @@ def parse_model(d, ch, verbose=True):
         elif m is FASA:
             c1 = c2 = ch[f]
             args = [c1, *args[1:]]
+        # Add this right after the main 'if m in {...}:' block
+        elif m in {WGCA, LKA}:
+            c1 = c2 = ch[f]         # Force input/output channels to match the previous layer
+            args = [c1, *args[1:]]  # Drop the dummy channel count from YAML, keep any extra kwargs
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

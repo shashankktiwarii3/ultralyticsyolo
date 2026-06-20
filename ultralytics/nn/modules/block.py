@@ -2335,3 +2335,93 @@ class CoordinationAttention(nn.Module):
         a_w = self.conv_w(x_w).sigmoid()
 
         return identity * a_h * a_w
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------------------------------------------------
+# Orthonormal Haar DWT / IDWT as fixed grouped convs.
+# Orthonormal => synthesis is the exact transpose of analysis, so the
+# DWT->IDWT round trip is lossless (reconstruction is exact). Implemented
+# as conv2d / conv_transpose2d (stride 2) so it stays ONNX/TensorRT
+# exportable -- important for YOLO26's edge story. Swap in
+# `pytorch_wavelets` (DWTForward/DWTInverse) if you prefer a vetted lib.
+# ----------------------------------------------------------------------
+def _haar2d():
+    s = 0.5  # (1/sqrt2)^2, orthonormal separable Haar
+    ll = torch.tensor([[ s,  s], [ s,  s]])
+    lh = torch.tensor([[ s,  s], [-s, -s]])
+    hl = torch.tensor([[ s, -s], [ s, -s]])
+    hh = torch.tensor([[ s, -s], [-s,  s]])
+    return torch.stack([ll, lh, hl, hh], 0)  # (4, 2, 2)
+
+
+class HaarDWT(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        w = _haar2d().unsqueeze(1).repeat(ch, 1, 1, 1)  # (4*ch, 1, 2, 2)
+        self.register_buffer("w", w)
+        self.ch = ch
+
+    def forward(self, x):
+        y = F.conv2d(x, self.w.to(x.dtype), stride=2, groups=self.ch)
+        B, _, H, W = y.shape
+        y = y.view(B, self.ch, 4, H, W)
+        return y[:, :, 0], y[:, :, 1], y[:, :, 2], y[:, :, 3]  # LL, LH, HL, HH
+
+
+class HaarIDWT(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        w = _haar2d().unsqueeze(1).repeat(ch, 1, 1, 1)  # (4*ch, 1, 2, 2)
+        self.register_buffer("w", w)
+        self.ch = ch
+
+    def forward(self, ll, lh, hl, hh):
+        B, C, H, W = ll.shape
+        y = torch.stack([ll, lh, hl, hh], 2).view(B, C * 4, H, W)
+        return F.conv_transpose2d(y, self.w.to(y.dtype), stride=2, groups=self.ch)
+
+
+class LKA(nn.Module):
+    """Decomposed large-kernel attention (Guo et al.): dw 5x5 + dilated dw
+    7x7 (d=3) -> ~21x21 effective RF -> 1x1 -> multiplicative gate."""
+    def __init__(self, ch, k=5, dk=7, d=3):
+        super().__init__()
+        self.dw  = nn.Conv2d(ch, ch, k, padding=k // 2, groups=ch)
+        self.dwd = nn.Conv2d(ch, ch, dk, padding=(dk // 2) * d, groups=ch, dilation=d)
+        self.pw  = nn.Conv2d(ch, ch, 1)
+
+    def forward(self, x):
+        return x * self.pw(self.dwd(self.dw(x)))
+
+
+class WGCA(nn.Module):
+    """Wavelet-Gated Context Attention.
+
+    Lossless Haar split -> long-range context (LKA) on the half-res LL band
+    (large RF at ~1/4 the FLOPs) -> context-gated high-frequency detail
+    subbands -> exact IDWT -> LayerScale residual (gamma init 0 keeps the
+    block at identity so it doesn't destabilise YOLO26's one-to-one head
+    early in training).
+
+    Drop in at P3 (and P2 if you add that head). Channels unchanged.
+    """
+    def __init__(self, ch):
+        super().__init__()
+        self.dwt   = HaarDWT(ch)
+        self.idwt  = HaarIDWT(ch)
+        self.ctx   = LKA(ch)
+        self.gate  = nn.Conv2d(ch, 3 * ch, 1)   # per-subband gates from context
+        self.proj  = nn.Conv2d(ch, ch, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        ll, lh, hl, hh = self.dwt(x)
+        ctx = self.ctx(ll)                              # long-range context on LL
+        gl, gh, ghh = torch.sigmoid(self.gate(ctx)).chunk(3, 1)
+        lh, hl, hh = lh * gl, hl * gh, hh * ghh         # gate detail by context
+        rec = self.idwt(ctx, lh, hl, hh)                # exact full-res recon
+        return x + self.gamma * self.proj(rec)
+
