@@ -1665,8 +1665,8 @@ def parse_model(d, ch, verbose=True):
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
         elif m in {WGCA, LKA}:
-            c1 = c2 = ch[f]         # Force input/output channels to match the previous layer
-            args = [c1, *args[1:]]  # Drop the dummy channel count from YAML, keep any extra kwargs
+            c1 = c2 = ch[f]              # channel-preserving
+            args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):
