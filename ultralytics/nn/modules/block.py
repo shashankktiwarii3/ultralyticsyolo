@@ -2383,45 +2383,41 @@ class HaarIDWT(nn.Module):
         y = torch.stack([ll, lh, hl, hh], 2).view(B, C * 4, H, W)
         return F.conv_transpose2d(y, self.w.to(y.dtype), stride=2, groups=self.ch)
 
-
 class LKA(nn.Module):
-    """Decomposed large-kernel attention (Guo et al.): dw 5x5 + dilated dw
-    7x7 (d=3) -> ~21x21 effective RF -> 1x1 -> multiplicative gate."""
-    def __init__(self, ch, k=5, dk=7, d=3):
+    """Decomposed large-kernel attention. Channel-preserving."""
+    def __init__(self, c1, c2=None, k=5, dk=7, d=3):
         super().__init__()
-        self.dw  = nn.Conv2d(ch, ch, k, padding=k // 2, groups=ch)
+        ch = c1
+        self.dw = nn.Conv2d(ch, ch, k, padding=k // 2, groups=ch)
         self.dwd = nn.Conv2d(ch, ch, dk, padding=(dk // 2) * d, groups=ch, dilation=d)
-        self.pw  = nn.Conv2d(ch, ch, 1)
+        self.pw = nn.Conv2d(ch, ch, 1)
 
     def forward(self, x):
         return x * self.pw(self.dwd(self.dw(x)))
 
 
 class WGCA(nn.Module):
-    """Wavelet-Gated Context Attention.
-
-    Lossless Haar split -> long-range context (LKA) on the half-res LL band
-    (large RF at ~1/4 the FLOPs) -> context-gated high-frequency detail
-    subbands -> exact IDWT -> LayerScale residual (gamma init 0 keeps the
-    block at identity so it doesn't destabilise YOLO26's one-to-one head
-    early in training).
-
-    Drop in at P3 (and P2 if you add that head). Channels unchanged.
+    """Wavelet-Gated Context Attention. Channel-preserving.
+    YAML args after the channel drive ablations:
+      [c]               -> context=True,  gate=True
+      [c, False, False] -> lossless wavelet only
+      [c, True, False]  -> context, no gating
     """
-    def __init__(self, ch):
+    def __init__(self, c1, c2=None, context=True, gate=True):
         super().__init__()
-        self.dwt   = HaarDWT(ch)
-        self.idwt  = HaarIDWT(ch)
-        self.ctx   = LKA(ch)
-        self.gate  = nn.Conv2d(ch, 3 * ch, 1)   # per-subband gates from context
-        self.proj  = nn.Conv2d(ch, ch, 1)
+        ch = c1
+        self.use_gate = gate
+        self.dwt = HaarDWT(ch)
+        self.idwt = HaarIDWT(ch)
+        self.ctx = LKA(ch) if context else nn.Identity()
+        self.gate_conv = nn.Conv2d(ch, 3 * ch, 1) if gate else None
+        self.proj = nn.Conv2d(ch, ch, 1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         ll, lh, hl, hh = self.dwt(x)
-        ctx = self.ctx(ll)                              # long-range context on LL
-        gl, gh, ghh = torch.sigmoid(self.gate(ctx)).chunk(3, 1)
-        lh, hl, hh = lh * gl, hl * gh, hh * ghh         # gate detail by context
-        rec = self.idwt(ctx, lh, hl, hh)                # exact full-res recon
-        return x + self.gamma * self.proj(rec)
-
+        ctx = self.ctx(ll)
+        if self.use_gate:
+            gl, gh, ghh = torch.sigmoid(self.gate_conv(ctx)).chunk(3, 1)
+            lh, hl, hh = lh * gl, hl * gh, hh * ghh
+        return x + self.gamma * self.proj(self.idwt(ctx, lh, hl, hh))
