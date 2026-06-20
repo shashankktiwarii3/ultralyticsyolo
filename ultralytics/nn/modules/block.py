@@ -2421,3 +2421,55 @@ class WGCA(nn.Module):
             gl, gh, ghh = torch.sigmoid(self.gate_conv(ctx)).chunk(3, 1)
             lh, hl, hh = lh * gl, hl * gh, hh * ghh
         return x + self.gamma * self.proj(self.idwt(ctx, lh, hl, hh))
+    
+class WCA(nn.Module):
+    """Wavelet Context Attention (gate-free). Lossless Haar split -> LKA context
+    on the half-res LL band -> exact IDWT -> LayerScale residual. Detail subbands
+    pass through unmodulated (gating ablated out after gate-inertness analysis)."""
+    def __init__(self, c1, c2=None):
+        super().__init__()
+        ch = c1
+        self.dwt = HaarDWT(ch)
+        self.idwt = HaarIDWT(ch)
+        self.ctx = LKA(ch)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        ll, lh, hl, hh = self.dwt(x)
+        ctx = self.ctx(ll)
+        return x + self.gamma * self.proj(self.idwt(ctx, lh, hl, hh))
+
+
+class ECA(nn.Module):
+    """Efficient channel attention (no FC, ~0 params)."""
+    def __init__(self, ch, k=3):
+        super().__init__()
+        self.conv = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
+
+    def forward(self, x):
+        y = x.mean((2, 3), keepdim=True)                       # B,C,1,1
+        y = self.conv(y.squeeze(-1).transpose(1, 2)).transpose(1, 2).unsqueeze(-1)
+        return x * torch.sigmoid(y)
+
+
+class MDC(nn.Module):
+    """Multi-scale Dilated Context — receptive-field expansion at P4.
+    Parallel depthwise dilated branches aggregate multi-scale context; ECA
+    reweights channels; LayerScale residual (gamma init 0, matches WCA / stable
+    on the end2end one-to-one head). Channel-preserving."""
+    def __init__(self, c1, c2=None, dilations=(1, 3, 5), k=3):
+        super().__init__()
+        ch = c1
+        self.branches = nn.ModuleList(
+            nn.Conv2d(ch, ch, k, padding=(k // 2) * d, dilation=d, groups=ch)
+            for d in dilations
+        )
+        self.fuse = nn.Conv2d(ch * len(dilations), ch, 1)
+        self.eca = ECA(ch)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        y = torch.cat([b(x) for b in self.branches], 1)
+        y = self.eca(self.fuse(y))
+        return x + self.gamma * y
