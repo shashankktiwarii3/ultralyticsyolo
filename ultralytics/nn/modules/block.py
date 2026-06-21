@@ -2473,3 +2473,35 @@ class MDC(nn.Module):
         y = torch.cat([b(x) for b in self.branches], 1)
         y = self.eca(self.fuse(y))
         return x + self.gamma * y
+
+class SAKA(nn.Module):
+    """Scale-Adaptive Kernel Attention. LKA uses one fixed dilated depthwise
+    conv for its large receptive field; SAKA replaces it with several dilated
+    branches whose per-location mixing weights are predicted from local content,
+    so the effective receptive field adapts to object scale (targets VisDrone's
+    extreme scale variance). Output form matches LKA (x * attn) for a clean swap.
+      adaptive=True  -> content-routed branch weights (full module)
+      adaptive=False -> fixed equal weights (multi-dilation control)
+    """
+    def __init__(self, c1, c2=None, adaptive=True, k=5, dilations=(1, 3, 5)):
+        super().__init__()
+        ch = c1
+        self.adaptive = adaptive
+        self.n = len(dilations)
+        self.local = nn.Conv2d(ch, ch, k, padding=k // 2, groups=ch)
+        self.branches = nn.ModuleList(
+            nn.Conv2d(ch, ch, k, padding=(k // 2) * d, dilation=d, groups=ch)
+            for d in dilations
+        )
+        self.router = nn.Conv2d(ch, self.n, 1) if adaptive else None
+        self.pw = nn.Conv2d(ch, ch, 1)
+
+    def forward(self, x):
+        loc = self.local(x)
+        outs = [b(loc) for b in self.branches]              # n x (B,C,H,W)
+        if self.adaptive:
+            w = torch.softmax(self.router(loc), dim=1)      # (B,n,H,W)
+            ctx = sum(outs[i] * w[:, i:i + 1] for i in range(self.n))
+        else:
+            ctx = sum(outs) / self.n
+        return x * self.pw(ctx)
