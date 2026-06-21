@@ -2483,7 +2483,7 @@ class SAKA(nn.Module):
       adaptive=True  -> content-routed branch weights (full module)
       adaptive=False -> fixed equal weights (multi-dilation control)
     """
-    def __init__(self, c1, c2=None, adaptive=True, k=5, dilations=(1, 3, 5)):
+    def __init__(self, c1, c2=None, adaptive=False, k=5, dilations=(1, 3, 5)):
         super().__init__()
         ch = c1
         self.adaptive = adaptive
