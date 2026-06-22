@@ -2591,25 +2591,44 @@ class LKA_HFGate(nn.Module):
         ctx = self.pw(self.dwd(self.dw(x)) * gate)   # LKA context, HF-gated
         return x * ctx
 
-class RepLKA(nn.Module):
-    """Train-time multi-branch; merges to plain LKA (k=5 DW + 7x7 d=3 DW + 1x1) at inference."""
-    def __init__(self, ch, k=5, dk=7, d=3, deploy=False):
-        super().__init__()
-        self.ch, self.k, self.dk, self.d, self.deploy = ch, k, dk, d, deploy
-        if deploy:
-            self.dw  = nn.Conv2d(ch, ch, k,  padding=k//2, groups=ch)
-            self.dwd = nn.Conv2d(ch, ch, dk, padding=(dk//2)*d, groups=ch, dilation=d)
-        else:
-            # stage 1 (dense, d=1): 5x5 + 3x3 parallel depthwise
-            self.dw_k = nn.Conv2d(ch, ch, k, padding=k//2, groups=ch)
-            self.dw_s = nn.Conv2d(ch, ch, 3, padding=1,   groups=ch)
-            # stage 2 (dilated, d=3): 7x7 + 5x5, BOTH at dilation d
-            self.dwd_k = nn.Conv2d(ch, ch, dk, padding=(dk//2)*d, groups=ch, dilation=d)
-            self.dwd_s = nn.Conv2d(ch, ch, 5,  padding=(5//2)*d,  groups=ch, dilation=d)
-        self.pw = nn.Conv2d(ch, ch, 1)
+import torch
+import torch.nn as nn
 
-    def _stage1(self, x): return self.dw(x) if self.deploy else self.dw_k(x) + self.dw_s(x)
-    def _stage2(self, x): return self.dwd(x) if self.deploy else self.dwd_k(x) + self.dwd_s(x)
+class RepLKA(nn.Module):
+    """
+    Train-time multi-branch Large Kernel Attention (LKA).
+    Merges to plain LKA (k=5 DW + 7x7 d=3 DW + 1x1) at inference.
+    """
+    def __init__(self, c1, c2, k=5, dk=7, d=3, deploy=False):
+        super().__init__()
+        
+        # In attention blocks, input channels (c1) usually equal output channels (c2).
+        # We use c2 for all convolutions to ensure consistency.
+        self.ch, self.k, self.dk, self.d, self.deploy = c2, k, dk, d, deploy
+        
+        if deploy:
+            # Inference-mode: Single unified convolution branches
+            self.dw  = nn.Conv2d(c2, c2, k,  padding=k//2, groups=c2)
+            self.dwd = nn.Conv2d(c2, c2, dk, padding=(dk//2)*d, groups=c2, dilation=d)
+        else:
+            # Training-mode: Multi-branch
+            # Stage 1 (dense, d=1): 5x5 + 3x3 parallel depthwise
+            self.dw_k = nn.Conv2d(c2, c2, k, padding=k//2, groups=c2)
+            self.dw_s = nn.Conv2d(c2, c2, 3, padding=1,   groups=c2)
+            
+            # Stage 2 (dilated, d=3): 7x7 + 5x5, BOTH at dilation d
+            self.dwd_k = nn.Conv2d(c2, c2, dk, padding=(dk//2)*d, groups=c2, dilation=d)
+            self.dwd_s = nn.Conv2d(c2, c2, 5,  padding=(5//2)*d,  groups=c2, dilation=d)
+            
+        # Pointwise convolution (1x1)
+        self.pw = nn.Conv2d(c2, c2, 1)
+
+    def _stage1(self, x): 
+        return self.dw(x) if self.deploy else self.dw_k(x) + self.dw_s(x)
+        
+    def _stage2(self, x): 
+        return self.dwd(x) if self.deploy else self.dwd_k(x) + self.dwd_s(x)
 
     def forward(self, x):
-        return x * self.pw(self._stage2(self._stage1(x)))   # keep your current integration form
+        # Attention scaling: x * Pointwise(Dilated_DW(Dense_DW(x)))
+        return x * self.pw(self._stage2(self._stage1(x)))
