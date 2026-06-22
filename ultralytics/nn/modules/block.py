@@ -2577,3 +2577,16 @@ class HRGA(nn.Module):
             d = d * g                                    # keep detail near objects
         d = F.pixel_unshuffle(d, 2)                      # (B,4C,H,W) lossless
         return f3 + self.gamma * self.fuse(d)            # (B,C,H,W)
+
+class LKA_HFGate(nn.Module):
+    def __init__(self, c1, c2=None, k=5, dk=7, d=3):
+        super().__init__(); ch = c1
+        self.dw  = nn.Conv2d(ch, ch, k, padding=k//2, groups=ch)
+        self.dwd = nn.Conv2d(ch, ch, dk, padding=(dk//2)*d, groups=ch, dilation=d)
+        self.pw  = nn.Conv2d(ch, ch, 1)
+        hp = torch.tensor([[[[-1,-1,-1],[-1,8,-1],[-1,-1,-1]]]], dtype=torch.float32)
+        self.register_buffer("hp", hp.repeat(ch, 1, 1, 1))
+    def forward(self, x):
+        gate = torch.sigmoid(torch.abs(F.conv2d(x, self.hp.to(x.dtype), padding=1, groups=x.shape[1])))
+        ctx = self.pw(self.dwd(self.dw(x)) * gate)   # LKA context, HF-gated
+        return x * ctx
