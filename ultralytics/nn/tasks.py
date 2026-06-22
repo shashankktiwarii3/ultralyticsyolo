@@ -1638,9 +1638,13 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in {WGCA, SAKA,HRGA,HFLKA, LKA,  WCA, MDC}:
+        if m in {WGCA, SAKA,HFLKA, LKA,  WCA, MDC}:
             c1 = c2 = ch[f]              # channel-preserving
             args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
+        elif m is HRGA:
+            c1 = ch[f[0]]          # F3 channels  (main path / output)
+            c2 = ch[f[1]]          # H2 channels  (detail source)
+            args = [c1, c2, *args] # yaml args are flags only; no nominal channel to drop
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
