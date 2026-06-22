@@ -2505,44 +2505,42 @@ class SAKA(nn.Module):
         else:
             ctx = sum(outs) / self.n
         return x * self.pw(ctx)
-    
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class HFLKA(nn.Module):
     """High-Frequency Large Kernel Attention.
-    Specifically designed for Tiny Object Detection (VisDrone).
-    1. Replaces LKA's dilated convs with dense asymmetric convs (fixes grid artifacts).
-    2. Adds a parameter-free high-frequency gate to suppress massive background noise.
+    Designed specifically for Tiny Object Detection (VisDrone).
+    1. Dense Asymmetric Convolutions: Fixes the 'grid artifact' of dilated convs.
+    2. High-Frequency Gate: Suppresses massive background noise.
     """
-    def __init__(self, c1, c2=None, k=7):
+    def __init__(self, c1, c2, k=7):
         super().__init__()
-        ch = c1
+        self.ch = c1
         
         # 1. Local dense feature extraction (matches LKA's first stage)
-        self.local = nn.Conv2d(ch, ch, 5, padding=2, groups=ch)
+        self.local = nn.Conv2d(self.ch, self.ch, 5, padding=2, groups=self.ch)
         
-        # 2. Dense Asymmetric Large Kernel (Replaces LKA's dilated conv)
-        # Creates a cross-shaped dense receptive field. No holes.
-        self.dw_h = nn.Conv2d(ch, ch, (1, k), padding=(0, k//2), groups=ch)
-        self.dw_v = nn.Conv2d(ch, ch, (k, 1), padding=(k//2, 0), groups=ch)
+        # 2. Dense Asymmetric Large Kernel (Cross-shaped, no holes)
+        self.dw_h = nn.Conv2d(self.ch, self.ch, (1, k), padding=(0, k // 2), groups=self.ch)
+        self.dw_v = nn.Conv2d(self.ch, self.ch, (k, 1), padding=(k // 2, 0), groups=self.ch)
         
         # 3. High-Frequency Gate (Parameter-free Laplacian)
         # Extracts edges/specks (tiny objects) and suppresses flat backgrounds
         hp = torch.tensor([[[[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]]], dtype=torch.float32)
-        self.register_buffer('hp', hp.repeat(ch, 1, 1, 1))
+        self.register_buffer('hp', hp.repeat(self.ch, 1, 1, 1))
         
         # 4. Projection
-        self.pw = nn.Conv2d(ch, ch, 1)
+        self.pw = nn.Conv2d(self.ch, self.ch, 1)
 
     def forward(self, x):
-        # Extract high-frequency mask (tiny objects = high response, background = low response)
-        hf = F.conv2d(x, self.hp.to(x.dtype), padding=1, groups=ch)
+        # Extract high-frequency mask 
+        # (Tiny objects = high response, Background = low response)
+        hf = F.conv2d(x, self.hp.to(x.dtype), padding=1, groups=self.ch)
         
-        # Use absolute value and sigmoid to create a soft attention mask.
-        # Flat background -> hf near 0 -> sigmoid(0) = 0.5 (attenuated)
-        # Tiny object/edge -> hf is large -> sigmoid(large) -> 1.0 (amplified)
+        # Soft attention mask
         gate = torch.sigmoid(torch.abs(hf)) 
         
         # Dense cross-shaped large kernel context
@@ -2553,3 +2551,29 @@ class HFLKA(nn.Module):
         
         # Output matches LKA format (x * attn) for a clean swap
         return x * self.pw(ctx)
+
+class HRGA(nn.Module):
+    """High-Resolution Gated Attention. Inputs [F3 (stride 8, main),
+    H2 (stride 4, detail source)]. F3 generates a semantic gate (WHERE objects
+    are); H2 carries the DETAIL; gate selects relevant detail; pixel-unshuffle
+    brings it losslessly to stride 8; LayerScale residual into F3.
+      gate=True  -> semantic gating (full module)
+      gate=False -> naive injection (control: is the gate doing anything?)
+    """
+    def __init__(self, c1, c2, gate=True):
+        super().__init__()                 # c1 = F3 ch (output), c2 = H2 ch (source)
+        self.gate = gate
+        self.proj = nn.Conv2d(c2, c1, 1)
+        self.gate_conv = nn.Conv2d(c1, 1, 1) if gate else None
+        self.fuse = nn.Conv2d(c1 * 4, c1, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        f3, h2 = x                                       # (B,C,H,W), (B,c2,2H,2W)
+        d = self.proj(h2)                                # (B,C,2H,2W)
+        if self.gate:
+            g = torch.sigmoid(self.gate_conv(f3))        # (B,1,H,W)
+            g = F.interpolate(g, scale_factor=2, mode="nearest")
+            d = d * g                                    # keep detail near objects
+        d = F.pixel_unshuffle(d, 2)                      # (B,4C,H,W) lossless
+        return f3 + self.gamma * self.fuse(d)            # (B,C,H,W)
