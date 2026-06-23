@@ -146,6 +146,29 @@ def bbox_iou(
         return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
     return iou  # IoU
 
+def bbox_nwd(box1, box2, xywh=False, eps=1e-7, constant=12.8):
+    """Normalized Wasserstein Distance (boxes as 2D Gaussians). Returns (...) in (0,1]."""
+    if xywh:
+        cx1, cy1, w1, h1 = box1.chunk(4, -1)
+        cx2, cy2, w2, h2 = box2.chunk(4, -1)
+    else:
+        x1a, y1a, x2a, y2a = box1.chunk(4, -1)
+        x1b, y1b, x2b, y2b = box2.chunk(4, -1)
+        cx1, cy1, w1, h1 = (x1a + x2a) / 2, (y1a + y2a) / 2, (x2a - x1a), (y2a - y1a)
+        cx2, cy2, w2, h2 = (x1b + x2b) / 2, (y1b + y2b) / 2, (x2b - x1b), (y2b - y1b)
+    w2_sq = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2 + ((w1 - w2) ** 2 + (h1 - h2) ** 2) / 4.0
+    return torch.exp(-torch.sqrt(w2_sq + eps) / constant).squeeze(-1)
+
+
+def size_gated_metric(iou, gt_box, xywh=False, s_thresh=8.0, tau=4.0, nwd=None):
+    """lambda(s)*NWD + (1-lambda(s))*IoU, with s = sqrt(w*h) of the GT box."""
+    if xywh:
+        w, h = gt_box[..., 2], gt_box[..., 3]
+    else:
+        w, h = (gt_box[..., 2] - gt_box[..., 0]), (gt_box[..., 3] - gt_box[..., 1])
+    s = torch.sqrt((w * h).clamp_(min=0) + 1e-9)
+    lam = torch.sigmoid((s_thresh - s) / tau)
+    return lam * nwd + (1.0 - lam) * iou
 
 def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Calculate masks IoU.

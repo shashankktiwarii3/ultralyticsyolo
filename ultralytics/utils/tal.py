@@ -10,6 +10,18 @@ from .metrics import bbox_iou, probiou
 from .ops import xywh2xyxy, xywhr2xyxyxyxy, xyxy2xywh
 from .torch_utils import TORCH_1_11
 
+from ultralytics.utils.metrics import bbox_iou, bbox_nwd, size_gated_metric
+
+NWD_CFG = dict(
+    use_in_assign=False,   # rows 3, 4
+    use_in_loss=False,     # rows 2, 4  (read in loss.py)
+    gate=True,             # row 5 -> False
+    s_thresh=8.0,
+    tau=4.0,
+    C_assign=4.0,          # grid-unit frame (assigner)
+    C_loss=12.8,           # loss-coordinate frame
+)
+
 
 class TaskAlignedAssigner(nn.Module):
     """A task-aligned assigner for object detection.
@@ -202,18 +214,27 @@ class TaskAlignedAssigner(nn.Module):
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
         return align_metric, overlaps
 
+    # def iou_calculation(self, gt_bboxes, pd_bboxes):
+    #     """Calculate IoU for horizontal bounding boxes.
+
+    #     Args:
+    #         gt_bboxes (torch.Tensor): Ground truth boxes.
+    #         pd_bboxes (torch.Tensor): Predicted boxes.
+
+    #     Returns:
+    #         (torch.Tensor): IoU values between each pair of boxes.
+    #     """
+    #     return bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
     def iou_calculation(self, gt_bboxes, pd_bboxes):
-        """Calculate IoU for horizontal bounding boxes.
-
-        Args:
-            gt_bboxes (torch.Tensor): Ground truth boxes.
-            pd_bboxes (torch.Tensor): Predicted boxes.
-
-        Returns:
-            (torch.Tensor): IoU values between each pair of boxes.
-        """
-        return bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
-
+        """Horizontal-box overlap, optionally size-gated NWD for tiny objects."""
+        iou = bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
+        if not NWD_CFG["use_in_assign"]:
+            return iou
+        nwd = bbox_nwd(gt_bboxes, pd_bboxes, xywh=False, constant=NWD_CFG["C_assign"])
+        if not NWD_CFG["gate"]:
+            return nwd
+        return size_gated_metric(iou, gt_bboxes, xywh=False,
+                                 s_thresh=NWD_CFG["s_thresh"], tau=NWD_CFG["tau"], nwd=nwd)
     def select_topk_candidates(self, metrics, topk_mask=None):
         """Select the top-k candidates based on the given metrics.
 
