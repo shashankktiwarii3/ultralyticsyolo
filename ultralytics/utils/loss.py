@@ -17,9 +17,6 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
-from ultralytics.utils.metrics import bbox_iou, bbox_nwd, size_gated_metric
-from ultralytics.utils.tal import NWD_CFG
-
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -131,21 +128,8 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        # iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        # loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        if NWD_CFG["use_in_loss"]:
-            nwd = bbox_nwd(pred_bboxes[fg_mask], target_bboxes[fg_mask],
-                           xywh=False, constant=NWD_CFG["C_loss"]).unsqueeze(-1)
-            if NWD_CFG["gate"]:
-                metric = size_gated_metric(iou.squeeze(-1), target_bboxes[fg_mask], xywh=False,
-                                           s_thresh=NWD_CFG["s_thresh"], tau=NWD_CFG["tau"],
-                                           nwd=nwd.squeeze(-1)).unsqueeze(-1)
-            else:
-                metric = nwd
-        else:
-            metric = iou
-        loss_iou = ((1.0 - metric) * weight).sum() / target_scores_sum
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
