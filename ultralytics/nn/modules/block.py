@@ -2632,3 +2632,85 @@ class RepLKA(nn.Module):
     def forward(self, x):
         # Attention scaling: x * Pointwise(Dilated_DW(Dense_DW(x)))
         return x * self.pw(self._stage2(self._stage1(x)))
+    
+import torch
+import torch.nn as nn
+
+class CSCA(nn.Module):
+    """
+    Center-Surround Contrastive Attention (CSCA).
+    Resolves the Activation Spread paradox in YOLO26's NMS-Free One-to-One head.
+    Pins activations to the exact center of tiny objects (VisDrone) and inhibits edges/background.
+    """
+    def __init__(self, c1, c2=None, k_center=3, k_surround=7):
+        super().__init__()
+        ch = c1
+        
+        # 1. Center Branch (Excitatory): Captures the exact core of tiny objects
+        self.center = nn.Conv2d(ch, ch, k_center, padding=k_center // 2, groups=ch)
+        
+        # 2. Surround Branch (Inhibitory): Captures local background/context
+        self.surround = nn.Conv2d(ch, ch, k_surround, padding=k_surround // 2, groups=ch)
+        
+        # 3. Learnable Channel-wise Inhibition Factor (gamma)
+        # Initialized to 1.0. Allows the network to learn the optimal suppression ratio.
+        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))
+        
+        # 4. Channel Projection
+        self.proj = nn.Conv2d(ch, ch, 1)
+        
+        # 5. LayerScale for stable integration with YOLO26's Progressive Loss
+        # Initialized to 1e-4 (Identity at start), slowly grows during training.
+        self.layer_scale = nn.Parameter(torch.ones(1, ch, 1, 1) * 1e-4)
+
+    def forward(self, x):
+        # Extract center and surround features
+        f_c = self.center(x)
+        f_s = self.surround(x)
+        
+        # Contrastive Gating: 
+        # If Center > Surround (isolated tiny object) -> Sigmoid > 0.5 (Amplify)
+        # If Surround >= Center (edges, clutter, large objects) -> Sigmoid <= 0.5 (Suppress)
+        contrast = f_c - (self.gamma * f_s)
+        attn = torch.sigmoid(contrast)
+        
+        # Generate attention map
+        attn_map = self.proj(attn)
+        
+        # Apply LayerScale residual (matches YOLO26 training stability)
+        return x + self.layer_scale * (x * attn_map)
+    
+class LCSA(nn.Module):
+    """Local Contrast & Surround Attention.
+    Built for YOLO26's NMS-free one-to-one head on dense tiny objects.
+    Instead of aggregating context (which smooths the spatial response and
+    blurs adjacent objects), it sharpens each location against its local
+    surround via *learnable divisive normalization*, increasing
+    center-vs-neighbor contrast so the one-to-one head can separate crowded
+    objects and the DFL-free head gets sharper localization features.
+    Channel-preserving. Multiplicative output (no LayerScale -> no dead gamma).
+    """
+    def __init__(self, c1, c2=None, kc=3, ks=9, eps=1e-3):
+        super().__init__()
+        ch = c1
+        self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)  # local detail
+        self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)  # local context
+        self.alpha    = nn.Parameter(torch.ones(1, ch, 1, 1))  # per-channel contrast gain
+        self.pw       = nn.Conv2d(ch, ch, 1)
+        self.eps      = eps
+
+        # Sensible init: center = identity (delta), surround = box blur.
+        # => at step 0 the module computes a normalized high-pass contrast gate
+        #    (a tiny-object / edge emphasizer) and then adapts per channel.
+        with torch.no_grad():
+            self.center.weight.zero_();  self.center.weight[:, :, kc // 2, kc // 2] = 1.0
+            self.surround.weight.fill_(1.0 / (ks * ks))
+            if self.center.bias is not None:   self.center.bias.zero_()
+            if self.surround.bias is not None: self.surround.bias.zero_()
+
+    def forward(self, x):
+        c = self.center(x)
+        s = self.surround(x)
+        contrast = (c - s) / torch.sqrt(s * s + self.eps)   # illumination-invariant local contrast
+        gate = torch.sigmoid(self.alpha * contrast)          # emphasize standout locations, damp flat surround
+        return x * self.pw(c * gate)                         # LKA-style multiplicative coupling
