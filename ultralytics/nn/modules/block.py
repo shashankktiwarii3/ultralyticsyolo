@@ -2715,187 +2715,136 @@ class LCSA(nn.Module):
         gate = torch.sigmoid(self.alpha * contrast)          # emphasize standout locations, damp flat surround
         return x * self.pw(c * gate)                         # LKA-style multiplicative coupling
     
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class LCSAv3(nn.Module):
-    """
-    Local Contrast & Surround Attention — Maximum AP Variant.
-    For YOLO26 NMS-free O2O heads on dense tiny objects (VisDrone, UAVDT, etc.).
-    
-    Design philosophy: every spatial location must compete with its neighbors.
-    No additive residuals — the network must earn its activation.
-    """
-    def __init__(
-        self,
-        c1,
-        c2=None,
-        kc=3,           # center kernel (object core)
-        ks=11,          # surround kernel (context) — ODD ONLY
-        eps=1e-5,       # tighter than default for numerical precision
-        reduction=2,    # aggressive bottleneck (more params in gate, fewer in pw)
-        use_var_norm=True,
-        use_multiscale=True,
-        use_max_suppress=True,
-        use_spatial_bias=True,
-    ):
+class SE(nn.Module):
+    """Squeeze-and-Excitation. Channel attention (the canonical baseline)."""
+    def __init__(self, c1, c2=None, r=16):
         super().__init__()
         ch = c1
-        assert kc % 2 == 1 and ks % 2 == 1, "Odd kernels only"
-        self.eps = eps
-        self.use_var_norm = use_var_norm
-        self.use_multiscale = use_multiscale
-        self.use_max_suppress = use_max_suppress
-        self.use_spatial_bias = use_spatial_bias
-        
-        # ─── CENTER: Excitatory, high-pass ───
-        # Depthwise separable with learnable sharpening
-        self.center = nn.Conv2d(ch, ch, kc, padding=kc//2, groups=ch, bias=False)
-        # Optional: second-order Laplacian for edge enhancement
-        self.center_lap = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
-        self.lap_weight = nn.Parameter(torch.tensor(0.3))  # blend factor
-        
-        # ─── SURROUND: Multi-scale, adaptive ───
-        # Primary: large mean pool
-        self.surround = nn.AvgPool2d(ks, stride=1, padding=ks//2, count_include_pad=False)
-        self.surround_sq = nn.AvgPool2d(ks, stride=1, padding=ks//2, count_include_pad=False)
-        
-        if use_multiscale:
-            # Secondary: smaller context for medium objects
-            ks2 = max(ks // 2, 5)
-            self.surround2 = nn.AvgPool2d(ks2, stride=1, padding=ks2//2, count_include_pad=False)
-            self.surround2_sq = nn.AvgPool2d(ks2, stride=1, padding=ks2//2, count_include_pad=False)
-            self.scale_mix = nn.Parameter(torch.tensor(0.6))  # bias toward large surround
-            
-            # Tertiary: very small for fine texture suppression
-            ks3 = 3
-            self.surround3 = nn.AvgPool2d(ks3, stride=1, padding=1, count_include_pad=False)
-            self.surround3_sq = nn.AvgPool2d(ks3, stride=1, padding=1, count_include_pad=False)
-            self.scale_mix3 = nn.Parameter(torch.tensor(0.2))
-        
-        if use_max_suppress:
-            # Max pool captures the strongest neighbor — critical when objects touch
-            self.surround_max = nn.MaxPool2d(ks, stride=1, padding=ks//2)
-            self.max_mix = nn.Parameter(torch.tensor(0.3))  # how much max vs mean
-        
-        # ─── CONTRAST GATING: Per-channel adaptive ───
-        # Gain with softplus (always positive, no dead ReLU)
-        self.alpha_raw = nn.Parameter(torch.ones(1, ch, 1, 1))
-        # Bias for asymmetric detection (dark obj on bright bg vs vice versa)
-        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
-        # Spatial bias: some channels should be excitatory everywhere
-        if use_spatial_bias:
-            self.spatial_bias = nn.Conv2d(ch, ch, 1, groups=ch, bias=False)
-            with torch.no_grad():
-                self.spatial_bias.weight.fill_(0.01)  # tiny positive everywhere
-        
-        # ─── MODULATION: Deep bottleneck + gating ───
-        # More compute here = better feature selection for the multiplicative path
-        self.pw = nn.Sequential(
-            nn.Conv2d(ch, ch // reduction, 1, bias=False),
-            nn.BatchNorm2d(ch // reduction),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch // reduction, 3, padding=1, groups=ch//reduction, bias=False),
-            nn.BatchNorm2d(ch // reduction),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch, 1, bias=False),
+        rd = max(ch // r, 8)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(ch, rd, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(rd, ch, 1, bias=True),
+            nn.Sigmoid(),
         )
-        
-        # ─── OUTPUT: Hard multiplicative, no residual leak ───
-        # Learnable base level so module isn't forced to start at identity
-        self.base = nn.Parameter(torch.ones(1, ch, 1, 1) * 0.5)  # start at 0.5x, grow up
-        self.residual_gate = nn.Parameter(torch.zeros(1, ch, 1, 1))  # learned residual mix
-        
-        # ─── INIT ───
-        with torch.no_grad():
-            # Center: soft delta with slight sharpening
-            self.center.weight.zero_()
-            self.center.weight[:, :, kc//2, kc//2] = 1.0
-            if kc >= 3:
-                # Small negative surround for high-pass effect
-                center_idx = kc // 2
-                for dy in range(kc):
-                    for dx in range(kc):
-                        if dy == center_idx and dx == center_idx:
-                            continue
-                        dist = abs(dy - center_idx) + abs(dx - center_idx)
-                        self.center.weight[:, :, dy, dx] = -0.15 / max(dist, 1)
-            
-            # Laplacian init
-            self.center_lap.weight.zero_()
-            self.center_lap.weight[:, :, 1, 1] = 4.0
-            self.center_lap.weight[:, :, 0, 1] = -1.0
-            self.center_lap.weight[:, :, 2, 1] = -1.0
-            self.center_lap.weight[:, :, 1, 0] = -1.0
-            self.center_lap.weight[:, :, 1, 2] = -1.0
-            
-            # Zero-init projection for stable start
-            self.pw[-1].weight.zero_()
-    
-    @property
-    def alpha(self):
-        # Softplus ensures positive gain, no clamping needed
-        return F.softplus(self.alpha_raw) + 0.01
-    
+
     def forward(self, x):
-        # ─── Center features ───
-        c = self.center(x)
-        if hasattr(self, 'center_lap'):
-            c = c + torch.tanh(self.lap_weight) * self.center_lap(x)
-        
-        # ─── Surround features ───
-        s = self.surround(x)
-        s_sq = self.surround_sq(x * x)
-        
-        if self.use_multiscale:
-            s2 = self.surround2(x)
-            s2_sq = self.surround2_sq(x * x)
-            s3 = self.surround3(x)
-            s3_sq = self.surround3_sq(x * x)
-            
-            mix2 = torch.sigmoid(self.scale_mix)
-            mix3 = torch.sigmoid(self.scale_mix3)
-            
-            # Hierarchical mixing: primary gets most weight
-            s = (1 - mix2 - mix3) * s + mix2 * s2 + mix3 * s3
-            s_sq = (1 - mix2 - mix3) * s_sq + mix2 * s2_sq + mix3 * s3_sq
-        
-        if self.use_max_suppress:
-            s_max = self.surround_max(x)
-            max_w = torch.sigmoid(self.max_mix)
-            s = max_w * s_max + (1 - max_w) * s
-        
-        # ─── Contrast: local signal-to-clutter ratio ───
-        if self.use_var_norm:
-            var = torch.relu(s_sq - s * s)
-            std = torch.sqrt(var + self.eps)
-            # Add mean abs as fallback for near-zero variance regions
-            mean_abs = torch.abs(s) + self.eps
-            contrast = (c - s) / (std + 0.5 * mean_abs + self.eps)
-        else:
-            contrast = (c - s) / (torch.abs(s) + self.eps)
-        
-        # Clamp to prevent saturation, but allow strong signals
-        contrast = torch.clamp(contrast, -30, 30)
-        
-        # ─── Gating: spatially-varying, channel-adaptive ───
-        gate = self.alpha * contrast + self.beta
-        if self.use_spatial_bias:
-            gate = gate + self.spatial_bias(x)
-        gate = torch.sigmoid(gate)
-        
-        # ─── Modulate and project ───
-        modulated = c * gate
-        projected = self.pw(modulated)
-        
-        # ─── Output: hard multiplicative with learned base ───
-        # tanh bounds the perturbation, base allows starting below 1.0
-        perturbation = torch.tanh(projected)
-        scale = self.base + torch.sigmoid(self.residual_gate) * perturbation
-        
-        # Ensure scale is positive and bounded
-        scale = F.relu(scale) + 0.1
-        
-        return x * scale
+        return x * self.fc(x)
+    
+class _ChannelAttn(nn.Module):
+    def __init__(self, ch, r=16):
+        super().__init__()
+        rd = max(ch // r, 8)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.max = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(ch, rd, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(rd, ch, 1, bias=False),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.mlp(self.avg(x)) + self.mlp(self.max(x)))
+
+
+class _SpatialAttn(nn.Module):
+    def __init__(self, k=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, k, padding=k // 2, bias=False)
+
+    def forward(self, x):
+        avg = x.mean(1, keepdim=True)
+        mx, _ = x.max(1, keepdim=True)
+        return torch.sigmoid(self.conv(torch.cat([avg, mx], 1)))
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module (channel + spatial)."""
+    def __init__(self, c1, c2=None, r=16, k=7):
+        super().__init__()
+        self.ca = _ChannelAttn(c1, r)
+        self.sa = _SpatialAttn(k)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+    
+
+class CoordAtt(nn.Module):
+    """Coordinate Attention. Position-aware channel attention (common in aerial)."""
+    def __init__(self, c1, c2=None, r=32):
+        super().__init__()
+        ch = c1
+        rd = max(ch // r, 8)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.conv1 = nn.Conv2d(ch, rd, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(rd)
+        self.act = nn.Hardswish()
+        self.conv_h = nn.Conv2d(rd, ch, 1, bias=False)
+        self.conv_w = nn.Conv2d(rd, ch, 1, bias=False)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        xh = self.pool_h(x)                       # b,c,h,1
+        xw = self.pool_w(x).permute(0, 1, 3, 2)   # b,c,w,1
+        y = torch.cat([xh, xw], dim=2)            # b,c,h+w,1
+        y = self.act(self.bn1(self.conv1(y)))
+        xh, xw = torch.split(y, [h, w], dim=2)
+        xw = xw.permute(0, 1, 3, 2)
+        ah = torch.sigmoid(self.conv_h(xh))
+        aw = torch.sigmoid(self.conv_w(xw))
+        return x * ah * aw
+
+class SimAM(nn.Module):
+    """SimAM — parameter-free attention. Include it to show a no-param comparator."""
+    def __init__(self, c1=None, c2=None, e_lambda=1e-4):
+        super().__init__()
+        self.e_lambda = e_lambda
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        n = h * w - 1
+        mu = x.mean([2, 3], keepdim=True)
+        d = (x - mu).pow(2)
+        v = d.sum([2, 3], keepdim=True) / n
+        e = d / (4 * (v + self.e_lambda)) + 0.5
+        return x * torch.sigmoid(e)
+    
+class EMA(nn.Module):
+    """Efficient Multi-scale Attention with cross-spatial learning.
+    `factor` = number of groups; channels must be divisible by it and
+    (channels // factor) must be > 0. At P3 in YOLO26n channels are small,
+    so use a small factor (e.g. 8 or 16), NOT the paper's default 32."""
+    def __init__(self, c1, c2=None, factor=8):
+        super().__init__()
+        ch = c1
+        self.groups = factor
+        assert ch % self.groups == 0 and ch // self.groups > 0, \
+            f"channels {ch} not compatible with factor {factor}"
+        g = ch // self.groups
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d(1)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(g, g)
+        self.conv1x1 = nn.Conv2d(g, g, 1)
+        self.conv3x3 = nn.Conv2d(g, g, 3, padding=1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        gx = x.reshape(b * self.groups, -1, h, w)          # b*g, c//g, h, w
+        xh = self.pool_h(gx)                                # ., ., h, 1
+        xw = self.pool_w(gx).permute(0, 1, 3, 2)            # ., ., w, 1
+        hw = self.conv1x1(torch.cat([xh, xw], dim=2))
+        xh, xw = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(gx * xh.sigmoid() * xw.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(gx)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (gx * weights.sigmoid()).reshape(b, c, h, w)
