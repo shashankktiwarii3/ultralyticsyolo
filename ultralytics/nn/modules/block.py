@@ -2680,76 +2680,43 @@ class CSCA(nn.Module):
         # Apply LayerScale residual (matches YOLO26 training stability)
         return x + self.layer_scale * (x * attn_map)
     
-# class LCSA(nn.Module):
-#     """Local Contrast & Surround Attention.
-#     Built for YOLO26's NMS-free one-to-one head on dense tiny objects.
-#     Instead of aggregating context (which smooths the spatial response and
-#     blurs adjacent objects), it sharpens each location against its local
-#     surround via *learnable divisive normalization*, increasing
-#     center-vs-neighbor contrast so the one-to-one head can separate crowded
-#     objects and the DFL-free head gets sharper localization features.
-#     Channel-preserving. Multiplicative output (no LayerScale -> no dead gamma).
-#     """
-#     def __init__(self, c1, c2=None, kc=3, ks=9, eps=1e-3):
-#         super().__init__()
-#         ch = c1
-#         self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)  # local detail
-#         self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)  # local context
-#         self.alpha    = nn.Parameter(torch.ones(1, ch, 1, 1))  # per-channel contrast gain
-#         self.pw       = nn.Conv2d(ch, ch, 1)
-#         self.eps      = eps
-
-#         # Sensible init: center = identity (delta), surround = box blur.
-#         # => at step 0 the module computes a normalized high-pass contrast gate
-#         #    (a tiny-object / edge emphasizer) and then adapts per channel.
-#         with torch.no_grad():
-#             self.center.weight.zero_();  self.center.weight[:, :, kc // 2, kc // 2] = 1.0
-#             self.surround.weight.fill_(1.0 / (ks * ks))
-#             if self.center.bias is not None:   self.center.bias.zero_()
-#             if self.surround.bias is not None: self.surround.bias.zero_()
-
-#     def forward(self, x):
-#         c = self.center(x)
-#         s = self.surround(x)
-#         contrast = (c - s) / torch.sqrt(s * s + self.eps)   # illumination-invariant local contrast
-#         gate = torch.sigmoid(self.alpha * contrast)          # emphasize standout locations, damp flat surround
-#         return x * self.pw(c * gate)                         # LKA-style multiplicative coupling
-    
-
 class LCSA(nn.Module):
-    """Scale-Adaptive Local Contrast & Surround Attention."""
-    def __init__(self, c1, c2=None, kc=3, ks=9, dilations=(1, 2, 4), eps=1e-3):
+    """Local Contrast & Surround Attention.
+    Built for YOLO26's NMS-free one-to-one head on dense tiny objects.
+    Instead of aggregating context (which smooths the spatial response and
+    blurs adjacent objects), it sharpens each location against its local
+    surround via *learnable divisive normalization*, increasing
+    center-vs-neighbor contrast so the one-to-one head can separate crowded
+    objects and the DFL-free head gets sharper localization features.
+    Channel-preserving. Multiplicative output (no LayerScale -> no dead gamma).
+    """
+    def __init__(self, c1, c2=None, kc=3, ks=9, eps=1e-3):
         super().__init__()
         ch = c1
-        self.center = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
-        self.surrounds = nn.ModuleList([                      # one surround per scale
-            nn.Conv2d(ch, ch, ks, padding=d * (ks // 2), dilation=d, groups=ch)
-            for d in dilations])
-        self.nS = len(dilations)
-        self.scale_sel = nn.Conv2d(ch, self.nS, 1)            # per-location scale logits (cheap)
-        self.alpha = nn.Parameter(torch.ones(1, ch, 1, 1))
-        self.pw = nn.Conv2d(ch, ch, 1)
-        self.eps, self.symmetric = eps, True                  # symmetric -> polarity-agnostic
+        self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)  # local detail
+        self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)  # local context
+        self.alpha    = nn.Parameter(torch.ones(1, ch, 1, 1))  # per-channel contrast gain
+        self.pw       = nn.Conv2d(ch, ch, 1)
+        self.eps      = eps
+
+        # Sensible init: center = identity (delta), surround = box blur.
+        # => at step 0 the module computes a normalized high-pass contrast gate
+        #    (a tiny-object / edge emphasizer) and then adapts per channel.
         with torch.no_grad():
-            self.center.weight.zero_(); self.center.weight[:, :, kc // 2, kc // 2] = 1.0
-            for conv in self.surrounds:
-                conv.weight.fill_(1.0 / (ks * ks))
-                if conv.bias is not None: conv.bias.zero_()
-            if self.center.bias is not None: self.center.bias.zero_()
-            nn.init.zeros_(self.pw.weight)                     # identity init -> step-0 no-op
-            if self.pw.bias is not None: nn.init.zeros_(self.pw.bias)
+            self.center.weight.zero_();  self.center.weight[:, :, kc // 2, kc // 2] = 1.0
+            self.surround.weight.fill_(1.0 / (ks * ks))
+            if self.center.bias is not None:   self.center.bias.zero_()
+            if self.surround.bias is not None: self.surround.bias.zero_()
 
     def forward(self, x):
         c = self.center(x)
-        w = torch.softmax(self.scale_sel(x), dim=1)           # B,nS,H,W soft scale pick
-        contrast = 0
-        for i, surround in enumerate(self.surrounds):
-            s = surround(x)
-            ci = (c - s) / torch.sqrt(s * s + self.eps)
-            if self.symmetric: ci = ci.abs()
-            contrast = contrast + w[:, i:i+1] * ci            # broadcast over channels
-        gate = torch.sigmoid(self.alpha * contrast)
-        return x * (1.0 + self.pw(c * gate))                  # residual, large-object friendly
+        s = self.surround(x)
+        contrast = (c - s) / torch.sqrt(s * s + self.eps)   # illumination-invariant local contrast
+        gate = torch.sigmoid(self.alpha * contrast)          # emphasize standout locations, damp flat surround
+        return x * self.pw(c * gate)                         # LKA-style multiplicative coupling
+    
+
+
 class SE(nn.Module):
     """Squeeze-and-Excitation. Channel attention (the canonical baseline)."""
     def __init__(self, c1, c2=None, r=16):
