@@ -1638,10 +1638,10 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in {WGCA, SAKA, LCSA,CSCA, RepLKA, LKA_HFGate,HFLKA, LKA,  WCA, MDC}:
+        if m in {WGCA, SAKA, LCSA,CSCA,CBAM, RepLKA, LKA_HFGate,HFLKA, LKA,  WCA, MDC}:
             c1 = c2 = ch[f]              # channel-preserving
             args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
-        elif m in {SE, ECA, CBAM, CoordAtt, SimAM, EMA}:
+        elif m in {SE, ECA, CoordAtt, SimAM, EMA}:
             c1 = ch[f]
             c2 = c1                 # channel-preserving, full stop
             args = [c1, *args[1:]]  # drop any user c2, keep extra hyperparams (ks, factor, etc.)
