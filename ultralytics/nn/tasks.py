@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from ultralytics.nn.modules.block import FASA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
