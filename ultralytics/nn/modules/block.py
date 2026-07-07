@@ -2679,87 +2679,101 @@ class CSCA(nn.Module):
         
         # Apply LayerScale residual (matches YOLO26 training stability)
         return x + self.layer_scale * (x * attn_map)
+import torch
+import torch.nn as nn
+
 
 class LCSAv2(nn.Module):
-    """Local Contrast & Surround Attention v2 (channel-preserving)."""
- 
-    def __init__(
-        self,
-        c1,
-        c2=None,           # unused; kept for Ultralytics parse_model compat
-        kc=3,              # center kernel size
-        ks=9,              # surround kernel size
-        zscore=True,       # U2: local-std denominator (False -> v1-style sqrt(s^2 + sigma^2))
-        dual_scale=False,  # U4: add a second, dilated surround
-        dilation2=2,       # dilation of the second surround
-        sigma_init=0.05,   # init of the learnable semi-saturation constant
-        residual=False,    # U5: x*(1 + pw(.)) with zero-init pw
-    ):
+    """Local Contrast & Surround Attention (final).
+
+    Built for YOLO26's NMS-free one-to-one head on dense tiny objects.
+    Sharpens each location against its local surround via learnable divisive
+    normalization (retinal center-surround / Heeger normalization), increasing
+    center-vs-neighbor contrast so the one-to-one head can separate crowded
+    objects. Channel-preserving; all ops are ONNX/TensorRT-friendly.
+
+    Changes vs. v1 (each is an ablation row -- see flags):
+      1. residual=True : y = x * (1 + pw(c * gate)) with pw zero-init
+         -> exact identity at step 0, gradients can't be killed by a bad gate.
+         (v1 behavior: residual=False, y = x * pw(c * gate))
+      2. beta          : per-channel gate bias, sigmoid(alpha*contrast + beta)
+         -> each channel learns its own contrast threshold.
+      3. ms=True       : adds a second, dilated surround (covers ~2x field)
+         mixed per-channel -> multi-scale object-size prior. Default False.
+      4. dilation      : dilate the main surround to enlarge its field
+         cheaply (effective field = dilation*(ks-1)+1) without extra params.
+
+    YAML usage (channel-preserving, c2 is ignored/derived):
+        - [-1, 1, LCSA, [256]]                      # defaults
+        - [-1, 1, LCSA, [256, 3, 9, 1, True, True]] # kc, ks, dilation, residual, ms
+    """
+
+    def __init__(self, c1, c2=None, kc=3, ks=9, dilation=1,
+                 residual=True, ms=False, eps=1e-3):
         super().__init__()
         ch = c1
-        self.ch, self.kc, self.ks = ch, kc, ks
-        self.zscore, self.dual_scale, self.dilation2 = zscore, dual_scale, dilation2
+        self.eps = eps
         self.residual = residual
- 
-        # Center: learnable depthwise, delta init (identity at step 0), as in v1.
+        self.ms = ms
+
+        # Center: local detail (depthwise)
         self.center = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
+        # Surround: local context (depthwise, optionally dilated)
+        pad = dilation * (ks // 2)
+        self.surround = nn.Conv2d(ch, ch, ks, padding=pad,
+                                  dilation=dilation, groups=ch)
+        if ms:
+            # Second surround at ~2x the field via dilation; per-channel mix.
+            d2 = dilation * 2
+            self.surround2 = nn.Conv2d(ch, ch, ks, padding=d2 * (ks // 2),
+                                       dilation=d2, groups=ch)
+            self.mix = nn.Parameter(torch.full((1, ch, 1, 1), 0.5))
+
+        # Per-channel contrast gain and gate threshold
+        self.alpha = nn.Parameter(torch.ones(1, ch, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
+
+        self.pw = nn.Conv2d(ch, ch, 1)
+
+        # Init: center = identity (delta), surround = box blur
+        # -> at step 0 the module computes a normalized high-pass contrast
+        #    gate (tiny-object / edge emphasizer), then adapts per channel.
         with torch.no_grad():
             self.center.weight.zero_()
             self.center.weight[:, :, kc // 2, kc // 2] = 1.0
+            self.surround.weight.fill_(1.0 / (ks * ks))
+            if ms:
+                self.surround2.weight.fill_(1.0 / (ks * ks))
+                if self.surround2.bias is not None:
+                    self.surround2.bias.zero_()
             if self.center.bias is not None:
                 self.center.bias.zero_()
- 
-        # U1: surround as per-channel spatial softmax over ks*ks logits.
-        # Zero logits -> uniform kernel == box blur (v1 init), but the kernel
-        # now stays a valid local averaging operator for all of training.
-        self.surround_logits = nn.Parameter(torch.zeros(ch, 1, ks * ks))
-        if dual_scale:
-            self.surround_logits2 = nn.Parameter(torch.zeros(ch, 1, ks * ks))
-            self.scale_mix = nn.Parameter(torch.zeros(1, ch, 1, 1))  # sigmoid -> 0.5/0.5
- 
-        # U2: learnable semi-saturation sigma, parameterized via softplus.
-        self.sigma_raw = nn.Parameter(
-            torch.full((1, ch, 1, 1), math.log(math.expm1(sigma_init)))
-        )
- 
-        # Gate: per-channel gain (v1) + U3 per-channel bias.
-        self.alpha = nn.Parameter(torch.ones(1, ch, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
- 
-        # Output coupling (LKA-style multiplicative), as in v1.
-        self.pw = nn.Conv2d(ch, ch, 1)
-        if residual:
-            nn.init.zeros_(self.pw.weight)
-            nn.init.zeros_(self.pw.bias)
- 
-    def _surround(self, x, x2, logits, dilation):
-        """Weighted local mean (and variance) under a softmax-normalized kernel."""
-        k = self.ks
-        w = logits.softmax(dim=-1).view(self.ch, 1, k, k)
-        pad = dilation * (k // 2)
-        s = F.conv2d(x, w, padding=pad, dilation=dilation, groups=self.ch)
-        if not self.zscore:
-            return s, s * s  # v1-style denominator (kept as an ablation path)
-        e2 = F.conv2d(x2, w, padding=pad, dilation=dilation, groups=self.ch)
-        return s, (e2 - s * s).clamp_min(0.0)  # local variance, >= 0 by Jensen
- 
+            if self.surround.bias is not None:
+                self.surround.bias.zero_()
+            if residual:
+                # Zero-init pw -> module is an exact identity at step 0.
+                self.pw.weight.zero_()
+                if self.pw.bias is not None:
+                    self.pw.bias.zero_()
+
     def forward(self, x):
         c = self.center(x)
-        x2 = x * x if self.zscore else None
-        sigma2 = F.softplus(self.sigma_raw) ** 2
- 
-        s, var = self._surround(x, x2, self.surround_logits, dilation=1)
-        contrast = (c - s) * torch.rsqrt(var + sigma2)  # bounded local z-score
- 
-        if self.dual_scale:
-            s2, var2 = self._surround(x, x2, self.surround_logits2, self.dilation2)
-            contrast2 = (c - s2) * torch.rsqrt(var2 + sigma2)
-            m = torch.sigmoid(self.scale_mix)
-            contrast = (1.0 - m) * contrast + m * contrast2
- 
+        s = self.surround(x)
+        if self.ms:
+            m = torch.sigmoid(self.mix)              # per-channel in (0,1)
+            s = m * s + (1.0 - m) * self.surround2(x)
+
+        # Illumination-invariant local contrast (divisive normalization).
+        # fp32 for the norm: s*s can underflow in fp16 on dark/flat regions.
+        cf, sf = c.float(), s.float()
+        contrast = ((cf - sf) / torch.sqrt(sf * sf + self.eps)).to(x.dtype)
+
+        # Emphasize standout locations, damp flat surround.
         gate = torch.sigmoid(self.alpha * contrast + self.beta)
-        y = self.pw(c * gate)
-        return x * (1.0 + y) if self.residual else x * y
+
+        if self.residual:
+            return x * (1.0 + self.pw(c * gate))     # identity at init
+        return x * self.pw(c * gate)                 # v1 (paper ablation row)
  
     
 class LCSA(nn.Module):
