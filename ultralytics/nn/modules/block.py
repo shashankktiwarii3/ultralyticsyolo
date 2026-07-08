@@ -2922,49 +2922,46 @@ def _topk_routing(q_r, k_r, topk):
     aff = torch.einsum("bqc,bkc->bqk", q_r, k_r) / (q_r.shape[-1] ** 0.5)
     _, idx = aff.topk(topk, dim=-1)          # (B, N_r, topk)
     return idx
-
 def _deform_sample(feat, offset, dilation, n_pts):
     """Deformable sampling via grid_sample (ONNX-exportable)."""
     B, C, H, W = feat.shape
     heads = offset.shape[1]
+    head_dim = C // heads  # <-- Calculate head_dim here
+    
     device = feat.device
     ys, xs = torch.meshgrid(
         torch.arange(H, device=device, dtype=feat.dtype),
         torch.arange(W, device=device, dtype=feat.dtype), indexing="ij")
-    base = torch.stack([xs, ys], dim=0).unsqueeze(0)            # (1,2,H,W)
+    base = torch.stack([xs, ys], dim=0).unsqueeze(0)            
     
-    dy = offset[:, :, :n_pts] * dilation                        # (B,heads,n_pts,H,W)
+    dy = offset[:, :, :n_pts] * dilation                        
     dx = offset[:, :, n_pts:] * dilation
     
     g = []
     for p in range(n_pts):
         gx = (base[0, 0] + dx[:, :, p]) / max(W - 1, 1) * 2 - 1
         gy = (base[0, 1] + dy[:, :, p]) / max(H - 1, 1) * 2 - 1
-        g.append(torch.stack([gx, gy], dim=-1))                 # (B,heads,H,W,2)
-    grid = torch.stack(g, dim=2)                                # (B,heads,n_pts,H,W,2)
+        g.append(torch.stack([gx, gy], dim=-1))                 
+        
+    grid = torch.stack(g, dim=2)                                
+    grid = grid.view(B * heads, n_pts, H * W, 2)
     
     # ---------------------------------------------------------
-    # FIXED: Reshape to a 4D grid instead of a 3D grid
-    # Old: grid = grid.view(B * heads, n_pts * H * W, 2)
-    # New: (N, H_out, W_out, 2) -> (B*heads, n_pts, H*W, 2)
-    grid = grid.view(B * heads, n_pts, H * W, 2)
+    # FIXED: Split feature channels across heads instead of duplicating them!
+    # Old: feat_rep = feat.unsqueeze(1).expand(...).reshape(B * heads, C, H, W)
+    # New: Group the batch and heads, and isolate the head_dim
+    feat_split = feat.view(B * heads, head_dim, H, W)
     # ---------------------------------------------------------
 
-    feat_rep = feat.unsqueeze(1).expand(-1, heads, -1, -1, -1).reshape(B * heads, C, H, W)
-    
-    sampled = F.grid_sample(feat_rep, grid, mode="bilinear",
+    sampled = F.grid_sample(feat_split, grid, mode="bilinear",
                             padding_mode="zeros", align_corners=True)
                             
-    # Since the grid had shape (..., n_pts, H*W, 2),
-    # the output has shape (B*heads, C, n_pts, H*W).
-    # We must reshape it back to your expected format.
-    sampled = sampled.view(B, heads, C, n_pts, H, W)
-    # Swap C and n_pts to match downstream expectations: (B, heads, n_pts, C, H, W)
+    # sampled is now (B * heads, head_dim, n_pts, H * W)
+    # Reshape and permute to match the (B, h, n_pts, head_dim, H, W) expectation in forward()
+    sampled = sampled.view(B, heads, head_dim, n_pts, H, W)
     sampled = sampled.permute(0, 1, 3, 2, 4, 5).contiguous()
     
-    return sampled                                     # (B,heads,n_pts,C,H,W)
-
-
+    return sampled
 class MSDPRA(nn.Module):
     """Multi-Scale Deformable Pyramid Routing Attention.
 
