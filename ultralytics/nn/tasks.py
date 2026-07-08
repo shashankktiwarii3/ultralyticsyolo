@@ -1671,7 +1671,7 @@ def parse_model(d, ch, verbose=True):
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
-        elif m is FASA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA:
+        elif m is FASA:
             c1 = c2 = ch[f]
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
