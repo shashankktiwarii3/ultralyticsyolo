@@ -3243,7 +3243,7 @@ class MuTOA(nn.Module):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import deform_conv2d
+from torchvision.ops import DeformConv2d
 
 class MSCA(nn.Module):
     """Multi-Scale Spectral-Context Attention.
@@ -3271,8 +3271,7 @@ class MSCA(nn.Module):
         
         # FIX 2: offset must have 2 * kH * kW channels = 18 for a 3x3 deformable conv
         self.offset = nn.Conv2d(ch, 2 * 3 * 3, 1)
-        self.deform_w = nn.Parameter(torch.empty(ch, 1, 3, 3))  # depthwise deformable weights
-        nn.init.kaiming_uniform_(self.deform_w, a=5**0.5)
+        self.deform_conv = DeformConv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
         
         # --- GSA ---
         # FIX 4: sp concatenation outputs 2*c channels
@@ -3297,7 +3296,7 @@ class MSCA(nn.Module):
         off = self.offset(q)
         
         # Depthwise deformable convolution (groups=ch)
-        vd = deform_conv2d(v, off, self.deform_w, padding=1, groups=self.ch)
+        vd = self.deform_conv(v, off)
         
         # Pad if H or W is not divisible by window size to prevent silent pixel dropping
         pad_h = (self.window - H % self.window) % self.window
