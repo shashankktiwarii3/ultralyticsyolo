@@ -3117,7 +3117,7 @@ class C2TSMA(nn.Module):
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
-        self.m = nn.Sequential(*(Conv(c_, c_, 3, shortcut=shortcut, g=g) for _ in range(n)))
+        self.m = nn.Sequential(*(Conv(c_, c_, 3, g=g) for _ in range(n)))
         # Apply TSMA on the concatenated features before final projection
         self.tsma = TSMA(2 * c_)
         self.cv3 = Conv(2 * c_, c2, 1)
