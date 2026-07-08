@@ -2679,133 +2679,56 @@ class CSCA(nn.Module):
         
         # Apply LayerScale residual (matches YOLO26 training stability)
         return x + self.layer_scale * (x * attn_map)
-import torch
-import torch.nn as nn
+
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 class LCSAv2(nn.Module):
-    """Local Contrast-Surround Attention v3: divisive normalization +
-    LOCAL SPATIAL COMPETITION (feature-level NMS).
-
-    Design rationale (from the v1/v2 experiments):
-      * v1 core is kept verbatim: multiplicative coupling y = x * pw(c*gate),
-        NO zero-init residual, NO beta threshold, NO multi-scale surround.
-        (v2's zero-init residual = exact identity at step 0 = lazy branch
-        under MuSGD; it never turned on. beta = per-channel off-switch.)
-      * NEW: the gate is a *local softmax* over a spatial window, so each
-        location's activation competes with its neighbors. Two adjacent tiny
-        objects -> the locally-stronger response wins, the surround is
-        actively suppressed. This is feature-level NMS for the one-to-one
-        head, and it is NOT expressible by any stack of convs + pointwise
-        nonlinearities (a conv output never depends on its neighbors'
-        outputs). This is the part MuSGD cannot subsume into the backbone.
-
-    All ops are ONNX/TensorRT-friendly (dwconv, exp, avg_pool, div, sigmoid).
-    Channel-preserving. c2 accepted for Ultralytics YAML parsing, ignored.
-
-    Ablation flags (one table row each):
-      compete=False  -> reduces to (near-)v1: sigmoid gate, no competition.
-      pw_init        -> 'random' (v1-faithful, default) or 'identity'.
-      kw             -> competition window (default = ks).
-
-    YAML:
-        - [-1, 1, LCSAv3, [256]]                    # defaults
-        - [-1, 1, LCSAv3, [256, 3, 9, 9, True]]     # kc, ks, kw, compete
+    """Local Contrast & Surround Attention (MuSGD-Stable Version).
+    Mathematically bounded and initialized to identity to ensure stable 
+    convergence under YOLO26's native MuSGD optimizer.
     """
-
-    def __init__(self, c1, c2=None, kc=3, ks=9, kw=None, compete=True,
-                 pw_init="random", eps=1e-3):
+    def __init__(self, c1, c2=None, kc=3, ks=9, eps=1e-3):
         super().__init__()
         ch = c1
-        self.eps = eps
-        self.compete = compete
-        self.kw = kw if kw is not None else ks
-
-        # --- v1 core: center-surround (depthwise) ---------------------------
-        self.center = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
+        self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
         self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)
-        self.alpha = nn.Parameter(torch.ones(1, ch, 1, 1))  # contrast gain
-        self.pw = nn.Conv2d(ch, ch, 1)
+        
+        # Learnable scale (temperature) parameter. Initialized to 0.
+        self.scale = nn.Parameter(torch.zeros(1, ch, 1, 1))
+        self.pw    = nn.Conv2d(ch, ch, 1)
+        self.eps   = eps
 
-        # Init: center = delta (identity), surround = box blur.
-        # -> step 0 computes a normalized high-pass contrast map.
+        # Sensible init: center = delta, surround = box blur
         with torch.no_grad():
-            self.center.weight.zero_()
-            self.center.weight[:, :, kc // 2, kc // 2] = 1.0
+            self.center.weight.zero_();  self.center.weight[:, :, kc // 2, kc // 2] = 1.0
             self.surround.weight.fill_(1.0 / (ks * ks))
-            for m in (self.center, self.surround):
-                if m.bias is not None:
-                    m.bias.zero_()
-            if pw_init == "identity":
-                self.pw.weight.copy_(
-                    torch.eye(ch).view(ch, ch, 1, 1))
-                if self.pw.bias is not None:
-                    self.pw.bias.zero_()
-            # pw_init == "random": leave default init (v1 behavior; the
-            # random pw forces gradient flow through the module from step 0
-            # instead of letting the optimizer bypass it).
+            if self.center.bias is not None:   self.center.bias.zero_()
+            if self.surround.bias is not None: self.surround.bias.zero_()
+            
+            # CRITICAL FIX: Zero-init projection so module starts as exact Identity
+            self.pw.weight.zero_()
+            if self.pw.bias is not None: self.pw.bias.zero_()
 
     def forward(self, x):
         c = self.center(x)
         s = self.surround(x)
-
-        # Illumination-invariant local contrast (divisive normalization).
-        # fp32: s*s underflows in fp16 on dark/flat regions.
-        cf, sf = c.float(), s.float()
-        contrast = (cf - sf) / torch.sqrt(sf * sf + self.eps)
-
-        if self.compete:
-            # Local softmax competition ("feature-level NMS").
-            # logits clamped so exp() is fp16-safe after cast back.
-            logit = torch.clamp(self.alpha.float() * contrast, -4.0, 4.0)
-            w = torch.exp(logit)
-            denom = F.avg_pool2d(
-                w, self.kw, stride=1, padding=self.kw // 2,
-                count_include_pad=False)          # no border deflation
-            # gate ~ relative saliency vs. neighborhood:
-            #   isolated peak  -> gate >> 1 (amplified)
-            #   peak's flanks  -> gate <  1 (suppressed by the winner)
-            #   flat region    -> gate ~= 1 (untouched)
-            gate = (w / (denom + 1e-6)).to(x.dtype)
-        else:
-            # v1 ablation row: independent per-location sigmoid gate.
-            gate = torch.sigmoid(
-                self.alpha.float() * contrast).to(x.dtype)
-
-        # v1 multiplicative coupling (empirically > residual form).
-        return x * self.pw(c * gate)
-
-    # --- MuSGD routing ------------------------------------------------------
-    # Muon's Newton-Schulz update is defined for dense 2D matrices. The
-    # depthwise kernels flatten to (k*k, 1) column vectors and alpha is a
-    # scalar field: orthogonalizing them is degenerate and fights the
-    # delta / box-blur init. Route ONLY pw.weight to the Muon group.
-    def musgd_param_groups(self):
-        muon = [self.pw.weight]
-        muon_ids = {id(p) for p in muon}
-        sgd = [p for p in self.parameters() if id(p) not in muon_ids]
-        return {"muon": muon, "sgd": sgd}
-
-
-def route_lcsa_params(model):
-    """Collect LCSAv3 params across a model for MuSGD group assignment.
-
-    Usage with the Ultralytics trainer: call after model build, then merge
-    the returned lists into the optimizer's existing param groups
-    (muon -> the Muon/matrix group, sgd -> the SGD/fallback group), making
-    sure these params are excluded from the default auto-assignment.
-    """
-    muon, sgd = [], []
-    for m in model.modules():
-        if isinstance(m, LCSAv3):
-            g = m.musgd_param_groups()
-            muon += g["muon"]
-            sgd += g["sgd"]
-    return muon, sgd
+        
+        # FIX 1: Safe Normalized Contrast.
+        # Dividing by |s| explodes on background pixels. Dividing by sum of magnitudes 
+        # strictly bounds the contrast to [-1, 1], preventing gradient explosion.
+        contrast = (c - s) / (torch.abs(c) + torch.abs(s) + self.eps)
+        
+        # FIX 2: Bounded Gating.
+        # Because contrast is bounded, Sigmoid won't instantly saturate to 0 or 1.
+        # Scale starts at 0, so sigmoid(0) = 0.5.
+        gate = torch.sigmoid(self.scale * contrast)
+        
+        # FIX 3: Additive Residual Connection.
+        # Multiplicative attention attenuates gradients. Additive preserves MuSGD momentum.
+        # Because pw is zero-init, the module acts as pure identity at epoch 0.
+        return x + self.pw(c * gate)
     
 class LCSA(nn.Module):
     """Local Contrast & Surround Attention.
