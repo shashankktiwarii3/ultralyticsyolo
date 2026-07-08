@@ -3080,7 +3080,6 @@ class C2MSDPRA(nn.Module):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules import Conv
 
 class TSMA(nn.Module):
     """Tensor-Spectral Micro-Attention for MuSGD & Tiny Objects."""
