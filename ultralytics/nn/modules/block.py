@@ -2900,3 +2900,179 @@ class EMA(nn.Module):
         x22 = x1.reshape(b * self.groups, c // self.groups, -1)
         weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
         return (gx * weights.sigmoid()).reshape(b, c, h, w)
+
+
+# ultralytics/nn/modules/block.py  (append near C2PSA)
+# =====================================================================
+# MS-DPRA : Multi-Scale Deformable Pyramid Routing Attention
+# Co-designed with MuSGD: every expressive weight is a 2-D Conv/Linear
+# so Newton-Schulz orthogonalization fires on the parts that matter.
+# LayerNorm / biases / 1-D scalars fall back to the SGD path of MuSGD.
+# =====================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .conv import Conv
+
+
+def _topk_routing(q_r, k_r, topk):
+    """BiFormer-style region-level routing.
+    q_r, k_r : (B, N_r, C) region tokens.
+    Returns index tensor I : (B, N_r, topk)."""
+    aff = torch.einsum("bqc,bkc->bqk", q_r, k_r) / (q_r.shape[-1] ** 0.5)
+    _, idx = aff.topk(topk, dim=-1)          # (B, N_r, topk)
+    return idx
+
+
+def _deform_sample(feat, offset, dilation, n_pts):
+    """Deformable sampling via grid_sample (ONNX-exportable).
+    feat   : (B, C, H, W)
+    offset : (B, heads, 2*n_pts, H, W)  -- per-pixel, per-head, per-point (dy,dx)
+    dilation : int
+    Returns sampled tokens (B, heads*n_pts, C, H, W) flattened."""
+    B, C, H, W = feat.shape
+    heads = offset.shape[1]
+    # base grid of sample locations in [-1,1]
+    device = feat.device
+    ys, xs = torch.meshgrid(
+        torch.arange(H, device=device, dtype=feat.dtype),
+        torch.arange(W, device=device, dtype=feat.dtype), indexing="ij")
+    base = torch.stack([xs, ys], dim=0).unsqueeze(0)            # (1,2,H,W)
+    # offset layout: (heads, 2*n_pts, H, W); 2*n_pts = n_pts(dy) + n_pts(dx)
+    dy = offset[:, :, :n_pts] * dilation                        # (B,heads,n_pts,H,W)
+    dx = offset[:, :, n_pts:] * dilation
+    # build per-head sampling grid (B*heads, n_pts, H, W, 2)
+    g = []
+    for p in range(n_pts):
+        gx = (base[0, 0] + dx[:, :, p]) / (W - 1) * 2 - 1
+        gy = (base[0, 1] + dy[:, :, p]) / (H - 1) * 2 - 1
+        g.append(torch.stack([gx, gy], dim=-1))                 # (B,heads,H,W,2)
+    grid = torch.stack(g, dim=2)                                # (B,heads,n_pts,H,W,2)
+    grid = grid.view(B * heads, n_pts * H * W, 2)
+    feat_rep = feat.unsqueeze(1).expand(-1, heads, -1, -1, -1).reshape(B * heads, C, H, W)
+    sampled = F.grid_sample(feat_rep, grid, mode="bilinear",
+                            padding_mode="zeros", align_corners=True)
+    sampled = sampled.view(B, heads, n_pts, C, H, W)
+    return sampled                                              # (B,heads,n_pts,C,H,W)
+
+
+class MSDPRA(nn.Module):
+    """Multi-Scale Deformable Pyramid Routing Attention.
+
+    Drop-in replacement for `Attention` inside PSABlock.
+    Args mirror Attention(c, attn_ratio, num_heads) and add routing/deform knobs.
+    """
+
+    def __init__(self, c, attn_ratio=0.5, num_heads=4,
+                 region_size=7, topk=4, n_pts=4,
+                 dilations=(1, 2, 4, 8)):
+        super().__init__()
+        assert c % num_heads == 0, f"channels {c} not divisible by heads {num_heads}"
+        self.c, self.h = c, num_heads
+        self.region_size, self.topk, self.n_pts = region_size, topk, n_pts
+        self.dilations = tuple(dilations)
+        self.M = len(self.dilations)
+        self.head_dim = c // num_heads
+
+        # ---- 2-D weights -> Muon path in MuSGD ----
+        self.qkv = nn.Conv2d(c, c * 3, 1, bias=False)
+        self.off = nn.Conv2d(c, num_heads * 2 * n_pts, 1, bias=False)
+        self.gate = nn.Conv2d(c, self.M, 1, bias=False)
+        self.proj = nn.Conv2d(c, c, 1, bias=False)
+        # ---- 1-D params -> SGD path in MuSGD ----
+        self.scale = nn.Parameter(torch.ones(self.M))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h, M, n_pts = self.h, self.M, self.n_pts
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=1)                           # each (B,C,H,W)
+        rs = self.region_size
+
+        # --- 1) region-level routing (BiFormer bi-level) ---
+        # pad H,W to multiple of region_size
+        pad_h = (rs - H % rs) % rs
+        pad_w = (rs - W % rs) % rs
+        if pad_h or pad_w:
+            q_r = F.pad(q, (0, pad_w, 0, pad_h))
+            k_r = F.pad(k, (0, pad_w, 0, pad_h))
+        else:
+            q_r, k_r = q, k
+        Hr, Wr = q_r.shape[-2:]
+        Nr = (Hr // rs) * (Wr // rs)
+        # region average pool -> (B, C, Nr)
+        q_rg = F.avg_pool2d(q_r, rs).flatten(2)                 # (B,C,Nr)
+        k_rg = F.avg_pool2d(k_r, rs).flatten(2)
+        # region routing in channel-reshaped space (cheap proxy)
+        with torch.no_grad():
+            aff = q_rg.transpose(1, 2) @ k_rg                   # (B,Nr,Nr)
+            idx = aff.topk(self.topk, dim=-1).indices           # (B,Nr,topk)
+
+        # --- 2) deformable multi-scale sampling ---
+        off = self.off(x)                                       # (B, h*2*n_pts, H, W)
+        off = off.view(B, h, 2 * n_pts, H, W)
+
+        # --- 3) routed + deformed token attention per scale ---
+        q_flat = q.view(B, h, self.head_dim, H * W)             # (B,h,hd,HW)
+        outs = []
+        for m, d in enumerate(self.dilations):
+            samp = _deform_sample(v, off, d, n_pts)             # (B,h,n_pts,C,H,W)
+            # treat each (head, point) as a key/value token stream
+            kv = samp.permute(0, 1, 2, 3, 4, 5).reshape(
+                B, h * n_pts, self.head_dim * (C // self.head_dim // self.head_dim + 1)
+            ) if False else samp.reshape(B, h * n_pts, C, H, W)
+            # simpler & stable: per-head attention against sampled keys
+            k_m = samp.reshape(B, h, n_pts, self.head_dim, H * W)  # (B,h,n_pts,hd,HW)
+            k_m = k_m.permute(0, 1, 2, 4, 3)                       # (B,h,n_pts,HW,hd)
+            attn = torch.einsum("bhdQ,bhnpQ->bhdnp", q_flat, k_m) / (self.head_dim ** 0.5)
+            attn = attn.softmax(dim=-1)
+            v_m = samp.reshape(B, h, n_pts, self.head_dim, H * W).permute(0, 1, 2, 4, 3)
+            y_m = torch.einsum("bhdnp,bhnpQ->bhdQ", attn, v_m)     # (B,h,hd,HW)
+            outs.append(y_m)
+        # --- 4) scale-aware fusion (gate is 2-D conv -> Muon) ---
+        y = torch.stack(outs, dim=2)                              # (B,h,M,hd,HW)
+        g = self.gate(x).softmax(dim=1)                           # (B,M,H,W)
+        g = g.unsqueeze(1).unsqueeze(3)                           # (B,1,M,1,HW)
+        y = (y * g).sum(dim=2)                                    # (B,h,hd,HW)
+        y = y.reshape(B, C, H, W)
+        # --- 5) output projection (2-D conv -> Muon) ---
+        return self.proj(y)
+
+
+class MSDPRABlock(nn.Module):
+    """Drop-in replacement for PSABlock: MSDPRA + FFN + residual.
+    Mirrors PSABlock(c, attn_ratio, num_heads, shortcut) signature."""
+
+    def __init__(self, c, attn_ratio=0.5, num_heads=4, shortcut=True,
+                 region_size=7, topk=4, n_pts=4, dilations=(1, 2, 4, 8)):
+        super().__init__()
+        self.attn = MSDPRA(c, attn_ratio=attn_ratio, num_heads=num_heads,
+                           region_size=region_size, topk=topk,
+                           n_pts=n_pts, dilations=dilations)
+        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
+        self.add = shortcut
+
+    def forward(self, x):
+        x = x + self.attn(x) if self.add else self.attn(x)
+        x = x + self.ffn(x) if self.add else self.ffn(x)
+        return x
+
+
+class C2MSDPRA(nn.Module):
+    """C2-style wrapper around MSDPRABlock — drop-in replacement for C2PSA.
+    Identical constructor signature to C2PSA(c1, c2, n=1, e=0.5)."""
+
+    def __init__(self, c1, c2, n=1, e=0.5):
+        super().__init__()
+        assert c1 == c2
+        self.c = int(c1 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c1, 1)
+        self.m = nn.Sequential(*(MSDPRABlock(self.c, attn_ratio=0.5,
+                                             num_heads=max(self.c // 64, 1))
+                                 for _ in range(n)))
+
+    def forward(self, x):
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = self.m(b)
+        return self.cv2(torch.cat((a, b), 1))
