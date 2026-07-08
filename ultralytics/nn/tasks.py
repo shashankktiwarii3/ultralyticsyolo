@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import FASA, C2TSMA, TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
+from ultralytics.nn.modules.block import FASA, MuTOA, C2TSMA, TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1602,7 +1602,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            FASA, C2TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1622,7 +1622,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            FASA, C2TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1641,7 +1641,7 @@ def parse_model(d, ch, verbose=True):
         if m in {WGCA, SAKA, LCSA, LCSAv2,CSCA,CBAM, RepLKA, LKA_HFGate,HFLKA, LKA,  WCA, MDC}:
             c1 = c2 = ch[f]              # channel-preserving
             args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
-        elif m in {SE, ECA, CoordAtt, SimAM, EMA}:
+        elif m in {SE, ECA, CoordAtt, SimAM, EMA, MuTOA}:
             c1 = ch[f]
             c2 = c1                 # channel-preserving, full stop
             args = [c1, *args[1:]]  # drop any user c2, keep extra hyperparams (ks, factor, etc.)

@@ -3127,3 +3127,92 @@ class C2TSMA(nn.Module):
         y2 = self.cv2(x)
         # Fused spatial features are enhanced by TSMA
         return self.cv3(self.tsma(torch.cat((y1, y2), 1)))
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from ultralytics.nn.modules.conv import Conv  # Conv2d + BN + SiLU, matches rest of YOLO26
+
+
+class SGCU(nn.Module):
+    """Spectral-Gated Channel Unit. All ops are Conv (ndim>=2) -> every
+    weight is auto-routed to MuSGD's Muon+SGD blend. No free 1D gates."""
+    def __init__(self, c, r=8):
+        super().__init__()
+        cr = max(c // r, 8)
+        self.dw = Conv(c, c, k=3, s=1, g=c, act=True)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc_l1, self.fc_l2 = Conv(c, cr, k=1, act=True), Conv(cr, c, k=1, act=False)
+        self.fc_g1, self.fc_g2 = Conv(c, cr, k=1, act=True), Conv(cr, c, k=1, act=False)
+
+    def forward(self, x):
+        l = self.fc_l2(self.fc_l1(self.pool(self.dw(x))))
+        g = self.fc_g2(self.fc_g1(self.pool(x)))
+        return x * torch.sigmoid(l + g)
+
+
+class StripAttention(nn.Module):
+    """Row/column-decomposed self-attention: O(HW(H+W)C) not O((HW)^2C).
+    The only way attention is computationally viable at P2/P3 resolution."""
+    def __init__(self, c, heads=None):
+        super().__init__()
+        self.heads = heads or max(c // 64, 1)  # same head-sizing convention as C2PSA
+        self.qkv = Conv(c, 3 * c, k=1, act=False)
+        self.proj = Conv(c, c, k=1, act=False)
+
+    @staticmethod
+    def _sdpa(q, k, v):
+        attn = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+        return attn.softmax(dim=-1) @ v
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h, dh = self.heads, C // self.heads
+        q, k, v = self.qkv(x).chunk(3, dim=1)
+        q, k, v = (t.reshape(B, h, dh, H, W) for t in (q, k, v))
+
+        qr, kr, vr = (t.permute(0, 3, 1, 4, 2).reshape(B * H, h, W, dh) for t in (q, k, v))
+        row = self._sdpa(qr, kr, vr).reshape(B, H, h, W, dh).permute(0, 2, 4, 1, 3).reshape(B, C, H, W)
+
+        qc, kc, vc = (t.permute(0, 4, 1, 3, 2).reshape(B * W, h, H, dh) for t in (q, k, v))
+        col = self._sdpa(qc, kc, vc).reshape(B, W, h, H, dh).permute(0, 2, 4, 3, 1).reshape(B, C, H, W)
+
+        return self.proj(row + col)
+
+
+class CSSA(nn.Module):
+    """Cross-Strip Spatial Attention: dilated local context + strip attention."""
+    def __init__(self, c, k=7, d=3):
+        super().__init__()
+        self.local = Conv(c, c, k=k, s=1, g=c, d=d, act=True)
+        self.strip = StripAttention(c)
+        self.merge = Conv(2 * c, c, k=1, act=False)
+
+    def forward(self, x):
+        return x + self.merge(torch.cat([self.local(x), self.strip(x)], dim=1))
+
+
+class MuTOA(nn.Module):
+    """Muon-synchronized Tiny-Object Attention.
+    YAML args: [c2, r]  where c2 = channels (in==out), r = channel reduction (default 8).
+    """
+    def __init__(self, c1, r=8):
+        super().__init__()
+        self.channel = SGCU(c1, r)
+        self.spatial = CSSA(c1)
+
+    def forward(self, x):
+        return self.spatial(self.channel(x))
