@@ -3076,3 +3076,55 @@ class C2MSDPRA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ultralytics.nn.modules import Conv
+
+class TSMA(nn.Module):
+    """Tensor-Spectral Micro-Attention for MuSGD & Tiny Objects."""
+    def __init__(self, c1):
+        super().__init__()
+        # 1. Fixed High-Pass Spectral Isolation (Laplacian/DoG)
+        # Non-optimizable 3D/4D tensor buffer (ignored by MuSGD)
+        k = 3
+        # Laplacian kernel for edge detection (isolates sub-10px boundaries)
+        laplacian_kernel = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32)
+        self.register_buffer('fixed_hp_kernel', laplacian_kernel.view(1, 1, k, k))
+        
+        # 2. MuSGD-Compliant Orthogonal Tensor Projection (4D Conv)
+        # Optimizable >2D parameters, NO bias, NO BatchNorm
+        self.proj = nn.Conv2d(c1, c1, 3, 1, 1, bias=False)
+        self.gate = nn.Conv2d(c1, c1, 1, 1, 0, bias=False) 
+
+    def forward(self, x):
+        # Isolate high-frequency spatial peaks (sub-10px edges) using Depthwise Conv
+        hp = F.conv2d(x, self.fixed_hp_kernel.expand(x.shape[1], -1, -1, -1), padding=1, groups=x.shape[1])
+        
+        # 4D Tensor Projection (Orthogonalized by MuSGD)
+        y = self.proj(hp)
+        y = self.gate(y) 
+        
+        # Additive Isometric Injection (Preserves signal magnitude)
+        return x + y
+
+class C2TSMA(nn.Module):
+    """CSP Bottleneck with TSMA for YOLO26 Tiny Object Detection.
+    Replaces standard C3k2/C2f blocks to preserve microscopic features.
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.m = nn.Sequential(*(Conv(c_, c_, 3, shortcut=shortcut, g=g) for _ in range(n)))
+        # Apply TSMA on the concatenated features before final projection
+        self.tsma = TSMA(2 * c_)
+        self.cv3 = Conv(2 * c_, c2, 1)
+
+    def forward(self, x):
+        y1 = self.m(self.cv1(x))
+        y2 = self.cv2(x)
+        # Fused spatial features are enhanced by TSMA
+        return self.cv3(self.tsma(torch.cat((y1, y2), 1)))
