@@ -3059,15 +3059,18 @@ class MSDPRABlock(nn.Module):
 
 
 class C2MSDPRA(nn.Module):
-    """C2-style wrapper around MSDPRABlock — drop-in replacement for C2PSA.
-    Identical constructor signature to C2PSA(c1, c2, n=1, e=0.5)."""
-
+    """C2-style wrapper around MSDPRABlock — drop-in replacement for C2PSA."""
     def __init__(self, c1, c2, n=1, e=0.5):
         super().__init__()
-        assert c1 == c2
-        self.c = int(c1 * e)
+        # 1. REMOVE the assert c1 == c2
+        
+        # 2. Base the hidden channels on c2 (the output), not c1
+        self.c = int(c2 * e)  
+        
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv(2 * self.c, c1, 1)
+        # 3. Ensure final projection goes to c2
+        self.cv2 = Conv(2 * self.c, c2, 1)  
+        
         self.m = nn.Sequential(*(MSDPRABlock(self.c, attn_ratio=0.5,
                                              num_heads=max(self.c // 64, 1))
                                  for _ in range(n)))
@@ -3076,6 +3079,16 @@ class C2MSDPRA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
+
+
+
+
+
+
+
+
+
+
 
 import torch
 import torch.nn as nn

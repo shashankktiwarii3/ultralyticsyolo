@@ -1602,7 +1602,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1622,7 +1622,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1641,7 +1641,7 @@ def parse_model(d, ch, verbose=True):
         if m in {WGCA, SAKA, LCSA, LCSAv2,CSCA,CBAM, RepLKA, LKA_HFGate,HFLKA, LKA,  WCA, MDC}:
             c1 = c2 = ch[f]              # channel-preserving
             args = [c1, c2, *args[1:]]   # keep ablation flags, drop nominal channelDrop the dummy channel count from YAML, keep any extra kwargs
-        elif m in {SE, ECA, CoordAtt, SimAM, EMA, MuTOA}:
+        elif m in {SE, ECA, CoordAtt, SimAM, EMA, MuTOA,MSDPRABlock, MSDPRA}:
             c1 = ch[f]
             c2 = c1                 # channel-preserving, full stop
             args = [c1, *args[1:]]  # drop any user c2, keep extra hyperparams (ks, factor, etc.)
