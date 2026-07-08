@@ -2682,99 +2682,130 @@ class CSCA(nn.Module):
 import torch
 import torch.nn as nn
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 class LCSAv2(nn.Module):
-    """Local Contrast & Surround Attention (final).
+    """Local Contrast-Surround Attention v3: divisive normalization +
+    LOCAL SPATIAL COMPETITION (feature-level NMS).
 
-    Built for YOLO26's NMS-free one-to-one head on dense tiny objects.
-    Sharpens each location against its local surround via learnable divisive
-    normalization (retinal center-surround / Heeger normalization), increasing
-    center-vs-neighbor contrast so the one-to-one head can separate crowded
-    objects. Channel-preserving; all ops are ONNX/TensorRT-friendly.
+    Design rationale (from the v1/v2 experiments):
+      * v1 core is kept verbatim: multiplicative coupling y = x * pw(c*gate),
+        NO zero-init residual, NO beta threshold, NO multi-scale surround.
+        (v2's zero-init residual = exact identity at step 0 = lazy branch
+        under MuSGD; it never turned on. beta = per-channel off-switch.)
+      * NEW: the gate is a *local softmax* over a spatial window, so each
+        location's activation competes with its neighbors. Two adjacent tiny
+        objects -> the locally-stronger response wins, the surround is
+        actively suppressed. This is feature-level NMS for the one-to-one
+        head, and it is NOT expressible by any stack of convs + pointwise
+        nonlinearities (a conv output never depends on its neighbors'
+        outputs). This is the part MuSGD cannot subsume into the backbone.
 
-    Changes vs. v1 (each is an ablation row -- see flags):
-      1. residual=True : y = x * (1 + pw(c * gate)) with pw zero-init
-         -> exact identity at step 0, gradients can't be killed by a bad gate.
-         (v1 behavior: residual=False, y = x * pw(c * gate))
-      2. beta          : per-channel gate bias, sigmoid(alpha*contrast + beta)
-         -> each channel learns its own contrast threshold.
-      3. ms=True       : adds a second, dilated surround (covers ~2x field)
-         mixed per-channel -> multi-scale object-size prior. Default False.
-      4. dilation      : dilate the main surround to enlarge its field
-         cheaply (effective field = dilation*(ks-1)+1) without extra params.
+    All ops are ONNX/TensorRT-friendly (dwconv, exp, avg_pool, div, sigmoid).
+    Channel-preserving. c2 accepted for Ultralytics YAML parsing, ignored.
 
-    YAML usage (channel-preserving, c2 is ignored/derived):
-        - [-1, 1, LCSA, [256]]                      # defaults
-        - [-1, 1, LCSA, [256, 3, 9, 1, True, True]] # kc, ks, dilation, residual, ms
+    Ablation flags (one table row each):
+      compete=False  -> reduces to (near-)v1: sigmoid gate, no competition.
+      pw_init        -> 'random' (v1-faithful, default) or 'identity'.
+      kw             -> competition window (default = ks).
+
+    YAML:
+        - [-1, 1, LCSAv3, [256]]                    # defaults
+        - [-1, 1, LCSAv3, [256, 3, 9, 9, True]]     # kc, ks, kw, compete
     """
 
-    def __init__(self, c1, c2=None, kc=3, ks=9, dilation=1,
-                 residual=True, ms=False, eps=1e-3):
+    def __init__(self, c1, c2=None, kc=3, ks=9, kw=None, compete=True,
+                 pw_init="random", eps=1e-3):
         super().__init__()
         ch = c1
         self.eps = eps
-        self.residual = residual
-        self.ms = ms
+        self.compete = compete
+        self.kw = kw if kw is not None else ks
 
-        # Center: local detail (depthwise)
+        # --- v1 core: center-surround (depthwise) ---------------------------
         self.center = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
-        # Surround: local context (depthwise, optionally dilated)
-        pad = dilation * (ks // 2)
-        self.surround = nn.Conv2d(ch, ch, ks, padding=pad,
-                                  dilation=dilation, groups=ch)
-        if ms:
-            # Second surround at ~2x the field via dilation; per-channel mix.
-            d2 = dilation * 2
-            self.surround2 = nn.Conv2d(ch, ch, ks, padding=d2 * (ks // 2),
-                                       dilation=d2, groups=ch)
-            self.mix = nn.Parameter(torch.full((1, ch, 1, 1), 0.5))
-
-        # Per-channel contrast gain and gate threshold
-        self.alpha = nn.Parameter(torch.ones(1, ch, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
-
+        self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)
+        self.alpha = nn.Parameter(torch.ones(1, ch, 1, 1))  # contrast gain
         self.pw = nn.Conv2d(ch, ch, 1)
 
-        # Init: center = identity (delta), surround = box blur
-        # -> at step 0 the module computes a normalized high-pass contrast
-        #    gate (tiny-object / edge emphasizer), then adapts per channel.
+        # Init: center = delta (identity), surround = box blur.
+        # -> step 0 computes a normalized high-pass contrast map.
         with torch.no_grad():
             self.center.weight.zero_()
             self.center.weight[:, :, kc // 2, kc // 2] = 1.0
             self.surround.weight.fill_(1.0 / (ks * ks))
-            if ms:
-                self.surround2.weight.fill_(1.0 / (ks * ks))
-                if self.surround2.bias is not None:
-                    self.surround2.bias.zero_()
-            if self.center.bias is not None:
-                self.center.bias.zero_()
-            if self.surround.bias is not None:
-                self.surround.bias.zero_()
-            if residual:
-                # Zero-init pw -> module is an exact identity at step 0.
-                self.pw.weight.zero_()
+            for m in (self.center, self.surround):
+                if m.bias is not None:
+                    m.bias.zero_()
+            if pw_init == "identity":
+                self.pw.weight.copy_(
+                    torch.eye(ch).view(ch, ch, 1, 1))
                 if self.pw.bias is not None:
                     self.pw.bias.zero_()
+            # pw_init == "random": leave default init (v1 behavior; the
+            # random pw forces gradient flow through the module from step 0
+            # instead of letting the optimizer bypass it).
 
     def forward(self, x):
         c = self.center(x)
         s = self.surround(x)
-        if self.ms:
-            m = torch.sigmoid(self.mix)              # per-channel in (0,1)
-            s = m * s + (1.0 - m) * self.surround2(x)
 
         # Illumination-invariant local contrast (divisive normalization).
-        # fp32 for the norm: s*s can underflow in fp16 on dark/flat regions.
+        # fp32: s*s underflows in fp16 on dark/flat regions.
         cf, sf = c.float(), s.float()
-        contrast = ((cf - sf) / torch.sqrt(sf * sf + self.eps)).to(x.dtype)
+        contrast = (cf - sf) / torch.sqrt(sf * sf + self.eps)
 
-        # Emphasize standout locations, damp flat surround.
-        gate = torch.sigmoid(self.alpha * contrast + self.beta)
+        if self.compete:
+            # Local softmax competition ("feature-level NMS").
+            # logits clamped so exp() is fp16-safe after cast back.
+            logit = torch.clamp(self.alpha.float() * contrast, -4.0, 4.0)
+            w = torch.exp(logit)
+            denom = F.avg_pool2d(
+                w, self.kw, stride=1, padding=self.kw // 2,
+                count_include_pad=False)          # no border deflation
+            # gate ~ relative saliency vs. neighborhood:
+            #   isolated peak  -> gate >> 1 (amplified)
+            #   peak's flanks  -> gate <  1 (suppressed by the winner)
+            #   flat region    -> gate ~= 1 (untouched)
+            gate = (w / (denom + 1e-6)).to(x.dtype)
+        else:
+            # v1 ablation row: independent per-location sigmoid gate.
+            gate = torch.sigmoid(
+                self.alpha.float() * contrast).to(x.dtype)
 
-        if self.residual:
-            return x * (1.0 + self.pw(c * gate))     # identity at init
-        return x * self.pw(c * gate)                 # v1 (paper ablation row)
- 
+        # v1 multiplicative coupling (empirically > residual form).
+        return x * self.pw(c * gate)
+
+    # --- MuSGD routing ------------------------------------------------------
+    # Muon's Newton-Schulz update is defined for dense 2D matrices. The
+    # depthwise kernels flatten to (k*k, 1) column vectors and alpha is a
+    # scalar field: orthogonalizing them is degenerate and fights the
+    # delta / box-blur init. Route ONLY pw.weight to the Muon group.
+    def musgd_param_groups(self):
+        muon = [self.pw.weight]
+        muon_ids = {id(p) for p in muon}
+        sgd = [p for p in self.parameters() if id(p) not in muon_ids]
+        return {"muon": muon, "sgd": sgd}
+
+
+def route_lcsa_params(model):
+    """Collect LCSAv3 params across a model for MuSGD group assignment.
+
+    Usage with the Ultralytics trainer: call after model build, then merge
+    the returned lists into the optimizer's existing param groups
+    (muon -> the Muon/matrix group, sgd -> the SGD/fallback group), making
+    sure these params are excluded from the default auto-assignment.
+    """
+    muon, sgd = [], []
+    for m in model.modules():
+        if isinstance(m, LCSAv3):
+            g = m.musgd_param_groups()
+            muon += g["muon"]
+            sgd += g["sgd"]
+    return muon, sgd
     
 class LCSA(nn.Module):
     """Local Contrast & Surround Attention.
