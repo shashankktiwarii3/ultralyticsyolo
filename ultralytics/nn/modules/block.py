@@ -3235,3 +3235,114 @@ class MuTOA(nn.Module):
 
     def forward(self, x):
         return self.spatial(self.channel(x))
+    
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.ops import deform_conv2d
+
+class MSCA(nn.Module):
+    """Multi-Scale Spectral-Context Attention.
+    MuSGD-aligned: separate Wq,Wk,Wv,Wo (2-D, Newton-Schulz applies);
+    windowed softmax (well-conditioned grads); minimal 1-D params."""
+    def __init__(self, c, reduction=2, window=4):
+        super().__init__()
+        ch = c // 2
+        self.c, self.ch, self.window = c, ch, window
+        
+        # --- FSE branch ---
+        # FIX 1: padding must be (21-1)*3//2 = 30
+        self.low = nn.Conv2d(ch, ch, 21, padding=30, dilation=3, groups=ch)
+        self.gate = nn.Conv2d(ch, ch, 1)
+        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))  # only 1-D param (routed to SGD)
+        
+        # --- DCA branch (SEPARATE 2-D projections -> Muon-friendly) ---
+        self.wq = nn.Conv2d(ch, ch, 1, bias=False)
+        self.wk = nn.Conv2d(ch, ch, 1, bias=False)
+        self.wv = nn.Conv2d(ch, ch, 1, bias=False)
+        self.wo = nn.Conv2d(ch, ch, 1, bias=False)
+        self.dwq = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        self.dwk = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        self.dwv = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        
+        # FIX 2: offset must have 2 * kH * kW channels = 18 for a 3x3 deformable conv
+        self.offset = nn.Conv2d(ch, 2 * 3 * 3, 1)
+        self.deform_w = nn.Parameter(torch.empty(ch, 1, 3, 3))  # depthwise deformable weights
+        nn.init.kaiming_uniform_(self.deform_w, a=5**0.5)
+        
+        # --- GSA ---
+        # FIX 4: sp concatenation outputs 2*c channels
+        self.scale = nn.Conv2d(c * 2, 1, 1)
+        # FIX 5: fuse takes the combined c channels + 1 channel for sg
+        self.fuse  = nn.Conv2d(c + 1, 1, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        lo, hi = x[:, :self.ch], x[:, self.ch:]
+        
+        # --- FSE ---
+        low = self.low(lo)
+        high = lo - low
+        gs = torch.sigmoid(self.gate(high))
+        wh = self.gamma * (high * gs - high.mean((2,3),keepdim=True)) / (high.std((2,3),keepdim=True) + 1e-5)
+        
+        # --- DCA ---
+        q = self.dwq(self.wq(hi))
+        k = self.dwk(self.wk(hi))
+        v = self.dwv(self.wv(hi))
+        off = self.offset(q)
+        
+        # Depthwise deformable convolution (groups=ch)
+        vd = deform_conv2d(v, off, self.deform_w, padding=1, groups=self.ch)
+        
+        # Pad if H or W is not divisible by window size to prevent silent pixel dropping
+        pad_h = (self.window - H % self.window) % self.window
+        pad_w = (self.window - W % self.window) % self.window
+        if pad_h > 0 or pad_w > 0:
+            q = F.pad(q, (0, pad_w, 0, pad_h))
+            k = F.pad(k, (0, pad_w, 0, pad_h))
+            vd = F.pad(vd, (0, pad_w, 0, pad_h))
+            
+        Hp, Wp = q.shape[-2], q.shape[-1]
+        
+        # windowed attention (4x4) -- well-conditioned softmax
+        qf = F.unfold(q, self.window, stride=self.window)            # (B, ch*w*w, L)
+        kf = F.unfold(k, self.window, stride=self.window)
+        vf = F.unfold(vd, self.window, stride=self.window)
+        
+        L = qf.shape[-1]
+        P = self.window * self.window
+        
+        qf = qf.transpose(1, 2).reshape(B, L, self.ch, P)
+        kf = kf.transpose(1, 2).reshape(B, L, self.ch, P)
+        vf = vf.transpose(1, 2).reshape(B, L, self.ch, P)
+        
+        # FIX 3: Correct einsum to compute pixel-to-pixel attention matrix over channels
+        A = torch.einsum('blcp,blcq->blpq', qf, kf) / (self.ch**0.5)
+        A = A.softmax(-1)
+        
+        # Apply attention to values -> (B, L, ch, P)
+        ctx = torch.einsum('blpq,blcq->blcp', A, vf)
+        
+        # Fold back to spatial dimensions
+        ctx = ctx.permute(0, 1, 3, 2).reshape(B, self.ch * P, L)
+        ctx = F.fold(ctx, (Hp, Wp), self.window, stride=self.window)
+        
+        # Crop back to original H, W if we padded
+        ctx = ctx[:, :, :H, :W]
+        ctx = self.wo(ctx)
+        
+        # --- GSA & Residual ---
+        sp = torch.cat([F.avg_pool2d(x, 2), F.max_pool2d(x, 2)], 1)
+        sp = F.interpolate(sp, size=(H, W), mode='nearest')
+        sg = F.softplus(self.scale(sp)) + 0.5
+        
+        # FIX 5: Recombine wh and ctx back to C channels before residual addition
+        combined = torch.cat([wh, ctx], dim=1)
+        alpha = torch.sigmoid(self.fuse(torch.cat([combined, sg], dim=1)))
+        
+        return x + alpha * combined
