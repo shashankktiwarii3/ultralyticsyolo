@@ -2923,37 +2923,46 @@ def _topk_routing(q_r, k_r, topk):
     _, idx = aff.topk(topk, dim=-1)          # (B, N_r, topk)
     return idx
 
-
 def _deform_sample(feat, offset, dilation, n_pts):
-    """Deformable sampling via grid_sample (ONNX-exportable).
-    feat   : (B, C, H, W)
-    offset : (B, heads, 2*n_pts, H, W)  -- per-pixel, per-head, per-point (dy,dx)
-    dilation : int
-    Returns sampled tokens (B, heads*n_pts, C, H, W) flattened."""
+    """Deformable sampling via grid_sample (ONNX-exportable)."""
     B, C, H, W = feat.shape
     heads = offset.shape[1]
-    # base grid of sample locations in [-1,1]
     device = feat.device
     ys, xs = torch.meshgrid(
         torch.arange(H, device=device, dtype=feat.dtype),
         torch.arange(W, device=device, dtype=feat.dtype), indexing="ij")
     base = torch.stack([xs, ys], dim=0).unsqueeze(0)            # (1,2,H,W)
-    # offset layout: (heads, 2*n_pts, H, W); 2*n_pts = n_pts(dy) + n_pts(dx)
+    
     dy = offset[:, :, :n_pts] * dilation                        # (B,heads,n_pts,H,W)
     dx = offset[:, :, n_pts:] * dilation
-    # build per-head sampling grid (B*heads, n_pts, H, W, 2)
+    
     g = []
     for p in range(n_pts):
-        gx = (base[0, 0] + dx[:, :, p]) / (W - 1) * 2 - 1
-        gy = (base[0, 1] + dy[:, :, p]) / (H - 1) * 2 - 1
+        gx = (base[0, 0] + dx[:, :, p]) / max(W - 1, 1) * 2 - 1
+        gy = (base[0, 1] + dy[:, :, p]) / max(H - 1, 1) * 2 - 1
         g.append(torch.stack([gx, gy], dim=-1))                 # (B,heads,H,W,2)
     grid = torch.stack(g, dim=2)                                # (B,heads,n_pts,H,W,2)
-    grid = grid.view(B * heads, n_pts * H * W, 2)
+    
+    # ---------------------------------------------------------
+    # FIXED: Reshape to a 4D grid instead of a 3D grid
+    # Old: grid = grid.view(B * heads, n_pts * H * W, 2)
+    # New: (N, H_out, W_out, 2) -> (B*heads, n_pts, H*W, 2)
+    grid = grid.view(B * heads, n_pts, H * W, 2)
+    # ---------------------------------------------------------
+
     feat_rep = feat.unsqueeze(1).expand(-1, heads, -1, -1, -1).reshape(B * heads, C, H, W)
+    
     sampled = F.grid_sample(feat_rep, grid, mode="bilinear",
                             padding_mode="zeros", align_corners=True)
-    sampled = sampled.view(B, heads, n_pts, C, H, W)
-    return sampled                                              # (B,heads,n_pts,C,H,W)
+                            
+    # Since the grid had shape (..., n_pts, H*W, 2),
+    # the output has shape (B*heads, C, n_pts, H*W).
+    # We must reshape it back to your expected format.
+    sampled = sampled.view(B, heads, C, n_pts, H, W)
+    # Swap C and n_pts to match downstream expectations: (B, heads, n_pts, C, H, W)
+    sampled = sampled.permute(0, 1, 3, 2, 4, 5).contiguous()
+    
+    return sampled                                     # (B,heads,n_pts,C,H,W)
 
 
 class MSDPRA(nn.Module):
