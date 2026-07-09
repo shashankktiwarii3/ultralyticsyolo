@@ -22,6 +22,42 @@ from .utils import bias_init_with_prob, linear_init
 
 __all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
+import torch.nn.functional as F
+
+class ISRF_Module(nn.Module):
+    """Implicit Sub-Pixel Regression Field for Tiny Objects"""
+    def __init__(self, in_channels, out_channels=4):
+        super().__init__()
+        # We use a 3x3 local context patch, so input is in_channels * 9
+        mlp_input_dim = in_channels * 9 
+        hidden_dim = max(16, in_channels // 2)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_channels)
+        )
+        # Initialize weights to predict near-zero offsets at the start of training
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x):
+        # x: Feature map of shape (B, C, H, W)
+        # Extract sliding 3x3 local blocks
+        x_unfold = F.unfold(x, kernel_size=3, padding=1) # Shape: (B, C*9, H*W)
+        
+        # Reshape back to spatial dimensions
+        x_unfold = x_unfold.view(x.size(0), x.size(1) * 9, x.size(2), x.size(3))
+        x_local = x_unfold.permute(0, 2, 3, 1).contiguous() # Shape: (B, H, W, C*9)
+        
+        # Predict sub-pixel offsets
+        offsets = self.mlp(x_local) # Shape: (B, H, W, out_channels)
+        
+        # Bound offsets to [-0.5, 0.5] so they act as true sub-pixel shifts
+        bounded_offsets = (torch.sigmoid(offsets) - 0.5) 
+        
+        # Permute back to (B, out_channels, H, W) to match standard Conv outputs
+        return bounded_offsets.permute(0, 3, 1, 2).contiguous()
 
 class Detect(nn.Module):
     """YOLO Detect head for object detection models.
@@ -107,21 +143,25 @@ class Detect(nn.Module):
                 for x in ch
             )
         )
+        self.isrf = nn.ModuleList(
+            ISRF_Module(in_channels=x, out_channels=4 * self.reg_max) for x in ch
+        )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+            self.one2one_isrf = copy.deepcopy(self.isrf)
 
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
-        return dict(box_head=self.cv2, cls_head=self.cv3)
+        return dict(box_head=self.cv2, cls_head=self.cv3, isrf_head=self.isrf)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, isrf_head=self.one2one_isrf)
 
     @property
     def end2end(self):
@@ -134,16 +174,30 @@ class Detect(nn.Module):
         self._end2end = value
 
     def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None, isrf_head: torch.nn.Module = None
     ) -> dict[str, torch.Tensor]:
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        """Concatenates and returns predicted bounding boxes and class probabilities with ISRF refinement."""
         if box_head is None or cls_head is None:  # for fused inference
             return dict()
         bs = x[0].shape[0]  # batch size
-        boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        
+        boxes = []
+        for i in range(self.nl):
+            # 1. Base Regression (Coarse bounding box)
+            base_coords = box_head[i](x[i])
+            
+            # 2. Add ISRF Sub-Pixel Shift if the head is provided
+            if isrf_head is not None:
+                base_coords = base_coords + isrf_head[i](x[i])
+                
+            # 3. View and append
+            boxes.append(base_coords.view(bs, 4 * self.reg_max, -1))
+            
+        boxes = torch.cat(boxes, dim=-1)
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        
         return dict(boxes=boxes, scores=scores, feats=x)
-
+    
     def forward(
         self, x: list[torch.Tensor]
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
