@@ -3352,7 +3352,8 @@ class HFRA(nn.Module):
     Uses a frozen Laplacian branch to isolate high-frequency tiny object textures.
     Uses nn.Linear (2D matrix) for fusion so MuSGD applies Muon orthogonalization.
     """
-    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1):
+    # FIX: Added 'n: int = 1' as the 3rd argument to intercept the Ultralytics parser
+    def __init__(self, c1: int, c2: int, n: int = 1, k: int = 3, s: int = 1):
         super().__init__()
         c_ = c2
         
