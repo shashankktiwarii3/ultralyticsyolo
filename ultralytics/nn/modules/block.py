@@ -3345,3 +3345,44 @@ class MSCA(nn.Module):
         alpha = torch.sigmoid(self.fuse(torch.cat([combined, sg], dim=1)))
         
         return x + alpha * combined
+
+
+
+class HFRA(nn.Module):
+    """High-Frequency Resonance Attention (HFRA) with MoL fusion.
+    Uses a frozen Laplacian branch to isolate high-frequency tiny object textures.
+    Uses nn.Linear (2D matrix) for fusion so MuSGD applies Muon orthogonalization.
+    """
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1):
+        super().__init__()
+        c_ = c2
+        # Base Semantic Branch
+        self.base_branch = nn.Sequential(
+            DWConv(c1, c_, k, s, g=1), 
+            Conv(c_, c_, 1, 1)
+        )
+        # Frozen High-Pass Resonance Branch
+        self.res_branch = nn.Conv2d(c1, c_, k, s, k//2, bias=False)
+        with torch.no_grad():
+            lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
+            w = lap.view(1, 1, 3, 3).repeat(c_, c1, 1, 1)
+            self.res_branch.weight.data.copy_(w)
+            self.res_branch.weight.requires_grad = False
+
+        # MoL Fusion: nn.Linear ensures MuSGD routes this to Muon optimizer
+        self.fusion = nn.Linear(2 * c_, c2)
+        self.act = nn.Sigmoid()
+        self.add = c1 == c2 and s == 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_base = self.base_branch(x)
+        x_res = self.res_branch(x)
+        
+        # Concatenate and permute for Linear layer [B, H, W, C]
+        x_cat = torch.cat([x_base, x_res], dim=1).permute(0, 2, 3, 1)
+        
+        # Attention generation
+        attn = self.act(self.fusion(x_cat)).permute(0, 3, 1, 2)
+        
+        out = x_base * attn
+        return out + x if self.add else out
