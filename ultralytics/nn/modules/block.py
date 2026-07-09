@@ -3347,6 +3347,9 @@ class MSCA(nn.Module):
         return x + alpha * combined
 
 
+import torch
+import torch.nn as nn
+from ultralytics.nn.modules import Conv, DWConv # Assuming these are imported
 
 class HFRA(nn.Module):
     """High-Frequency Resonance Attention (HFRA) with MoL fusion.
@@ -3356,14 +3359,17 @@ class HFRA(nn.Module):
     def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1):
         super().__init__()
         c_ = c2
-        # Base Semantic Branch
+        
+        # Base Semantic Branch (FIXED: Removed g=1 from DWConv)
         self.base_branch = nn.Sequential(
-            DWConv(c1, c_, k, s, g=1), 
+            DWConv(c1, c_, k, s), 
             Conv(c_, c_, 1, 1)
         )
+        
         # Frozen High-Pass Resonance Branch
         self.res_branch = nn.Conv2d(c1, c_, k, s, k//2, bias=False)
         with torch.no_grad():
+            # Note: This explicitly assumes k=3. If you ever pass k=5, you will need a 5x5 Laplacian!
             lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
             w = lap.view(1, 1, 3, 3).repeat(c_, c1, 1, 1)
             self.res_branch.weight.data.copy_(w)
