@@ -1617,7 +1617,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention, HFRA
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention, HFRA
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1637,7 +1637,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1664,6 +1664,10 @@ def parse_model(d, ch, verbose=True):
             c1 = ch[f[0]]          # F3 channels  (main path / output)
             c2 = ch[f[1]]          # H2 channels  (detail source)
             args = [c1, c2, *args] # yaml args are flags only; no nominal channel to drop
+        elif m is HighFreqInject:
+            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
+            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
+            args = [c1, c2]
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
@@ -1690,10 +1694,6 @@ def parse_model(d, ch, verbose=True):
             c1 = c2 = ch[f]
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
-        elif m is HighFreqInject:
-            c1 = ch[f[1]]  # channels from the high-res source (P2)
-            c2 = args[1]   # target channels (P3)
-            args = [c1, c2]
         elif m is TSMA:  # <--- ADD THIS BLOCK
             c2 = ch[f]
             args = [c2]
