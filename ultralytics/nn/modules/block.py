@@ -3388,3 +3388,24 @@ class HFRA(nn.Module):
         
         out = x_base * attn
         return out + x if self.add else out
+
+class HighFreqInject(nn.Module):
+    """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
+    def __init__(self, c1, c2):
+        super().__init__()
+        # Laplacian kernel for edge detection (high-pass filter)
+        self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
+        kernel = torch.tensor([[[[0., 1., 0.],
+                                 [1., -4., 1.],
+                                 [0., 1., 0.]]]], dtype=torch.float32)
+        self.laplacian.weight.data = kernel.repeat(c1, 1, 1, 1)
+        self.laplacian.requires_grad_(False) # Fixed high-pass filter
+        
+        # Projection to match target channels
+        self.proj = Conv(c1, c2, 1, 1)
+
+    def forward(self, x):
+        # x is a list: [target_features (P3), source_features (P2)]
+        target, source = x[0], x[1]
+        edges = self.laplacian(source)
+        return target + self.proj(edges)

@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import FASA, MuTOA, C2TSMA, TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
+from ultralytics.nn.modules.block import FASA, MuTOA, C2TSMA, TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -77,7 +77,17 @@ from ultralytics.nn.modules import (
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
+# from ultralytics.utils.loss import (
+#     E2ELoss,
+#     PoseLoss26,
+#     v8ClassificationLoss,
+#     v8DetectionLoss,
+#     v8OBBLoss,
+#     v8PoseLoss,
+#     v8SegmentationLoss,
+# )
 from ultralytics.utils.loss import (
+    DensityAwareE2ELoss,
     E2ELoss,
     PoseLoss26,
     v8ClassificationLoss,
@@ -334,9 +344,14 @@ class BaseModel(torch.nn.Module):
             preds = self.forward(batch["img"])
         return self.criterion(preds, batch)
 
+    # def init_criterion(self):
+    #     """Initialize the loss criterion for the BaseModel."""
+    #     raise NotImplementedError("compute_loss() needs to be implemented by task heads")
+
+
     def init_criterion(self):
-        """Initialize the loss criterion for the BaseModel."""
-        raise NotImplementedError("compute_loss() needs to be implemented by task heads")
+        """Initialize the loss criterion for the DetectionModel."""
+        return DensityAwareE2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
 class DetectionModel(BaseModel):
@@ -1602,7 +1617,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention, HFRA
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention, HFRA
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1622,7 +1637,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1675,6 +1690,10 @@ def parse_model(d, ch, verbose=True):
             c1 = c2 = ch[f]
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
+        elif m is HighFreqInject:
+            c1 = ch[f[1]]  # channels from the high-res source (P2)
+            c2 = args[1]   # target channels (P3)
+            args = [c1, c2]
         elif m is TSMA:  # <--- ADD THIS BLOCK
             c2 = ch[f]
             args = [c2]

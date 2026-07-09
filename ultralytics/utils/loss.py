@@ -1158,27 +1158,7 @@ class E2ELoss:
         one2many, one2one = preds["one2many"], preds["one2one"]
         loss_one2many = self.one2many.loss(one2many, batch)
         loss_one2one = self.one2one.loss(one2one, batch)
-        
-        # --- YOLO26-FR: Density-Masked Progressive Loss (DM-PL) ---
-        # Calculate tiny object ratio in the current batch
-        gt_bboxes = batch["bboxes"] # normalized xywh
-        if gt_bboxes.shape[0] > 0:
-            areas = gt_bboxes[:, 2] * gt_bboxes[:, 3]
-            # Threshold for tiny objects (~16x16 in 640x640 image)
-            tiny_ratio = (areas < 0.001).float().mean() 
-        else:
-            tiny_ratio = 0.0
-            
-        # If in early training (first 20%) and batch is dense with tiny objects, 
-        # downweight the One-to-One loss to prevent gradient instability.
-        total_steps = max(self.one2one.hyp.epochs * 100, 1) # Rough estimate of steps
-        if self.updates < (total_steps * 0.2) and tiny_ratio > 0.3:
-            o2o_weight = 0.1 * self.o2o  # Heavily downweight E2E head
-        else:
-            o2o_weight = self.o2o
-        # --------------------------------------------------------
-
-        return loss_one2many[0] * self.o2m + loss_one2one[0] * o2o_weight, loss_one2one[1]
+        return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
 
     def update(self) -> None:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""
@@ -1256,3 +1236,86 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+class DensityAwarev8DetectionLoss(v8DetectionLoss):
+    """Criterion class for computing training losses with density-aware O2O assignment for tiny objects."""
+
+    def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        pred_distri, pred_scores = (
+            preds["boxes"].permute(0, 2, 1).contiguous(),
+            preds["scores"].permute(0, 2, 1).contiguous(),
+        )
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        
+        # --- YOLO26-Fovea: Dynamic Density-Aware TopK2 Adjustment ---
+        # Calculate the number of valid GTs per image in the batch
+        if hasattr(self.assigner, "topk2"):
+            valid_gt_counts = mask_gt.squeeze(-1).sum(dim=-1)
+            max_density = valid_gt_counts.max().item()
+            
+            # If the image is highly dense (e.g., > 50 tiny objects), increase topk2
+            # This allows the O2O head to output multiple distinct boxes for clustered anchors
+            if max_density > 50:
+                self.assigner.topk2 = max(2, 1 + int(max_density / 50))
+            else:
+                self.assigner.topk2 = 1
+        # -------------------------------------------------------------
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+        target_scores_sum = max(target_scores.sum(), 1)
+        
+        # Cls loss
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        
+        # Bbox loss
+        if fg_mask.sum():
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                imgsz,
+                stride_tensor,
+            )
+            
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+        
+        return (
+            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
+            loss,
+            loss.detach(),
+        )
+
+class DensityAwareE2ELoss(E2ELoss):
+    """E2E Loss that utilizes the DensityAwarev8DetectionLoss for the One-to-One head."""
+    def __init__(self, model):
+        """Initialize DensityAwareE2ELoss."""
+        # Use standard v8DetectionLoss for One-to-Many (dense supervision)
+        super().__init__(model, loss_fn=v8DetectionLoss)
+        # Override the One-to-One loss with our density-aware version
+        self.one2one = DensityAwarev8DetectionLoss(model, tal_topk=7, tal_topk2=1)
