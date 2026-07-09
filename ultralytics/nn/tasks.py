@@ -77,7 +77,19 @@ from ultralytics.nn.modules import (
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
+from ultralytics.utils.loss import (
+    E2ELoss,
+    FoveaDetectionLoss,   # add
+    FoveaE2ELoss,         # add
+    PoseLoss26,
+    v8ClassificationLoss,
+    v8DetectionLoss,
+    v8OBBLoss,
+    v8PoseLoss,
+    v8SegmentationLoss,
+)
 # from ultralytics.utils.loss import (
+#     DensityAwareE2ELoss,
 #     E2ELoss,
 #     PoseLoss26,
 #     v8ClassificationLoss,
@@ -86,16 +98,6 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_yam
 #     v8PoseLoss,
 #     v8SegmentationLoss,
 # )
-from ultralytics.utils.loss import (
-    DensityAwareE2ELoss,
-    E2ELoss,
-    PoseLoss26,
-    v8ClassificationLoss,
-    v8DetectionLoss,
-    v8OBBLoss,
-    v8PoseLoss,
-    v8SegmentationLoss,
-)
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
 from ultralytics.utils.plotting import feature_visualization
@@ -344,14 +346,9 @@ class BaseModel(torch.nn.Module):
             preds = self.forward(batch["img"])
         return self.criterion(preds, batch)
 
-    # def init_criterion(self):
-    #     """Initialize the loss criterion for the BaseModel."""
-    #     raise NotImplementedError("compute_loss() needs to be implemented by task heads")
-
-
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
-        return DensityAwareE2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        """Initialize the loss criterion for the BaseModel."""
+        raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
 
 class DetectionModel(BaseModel):
@@ -524,9 +521,12 @@ class DetectionModel(BaseModel):
         y[-1] = y[-1][..., i:]  # small
         return y
 
+    # def init_criterion(self):
+    #     """Initialize the loss criterion for the DetectionModel."""
+    #     return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
-        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        from ultralytics.utils.loss import FoveaE2ELoss
+        return FoveaE2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1665,9 +1665,9 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f[1]]          # H2 channels  (detail source)
             args = [c1, c2, *args] # yaml args are flags only; no nominal channel to drop
         elif m is HighFreqInject:
-            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
-            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
-            args = [c1, c2]
+            c_tgt, c_src = ch[f[0]], ch[f[1]]   # [target P3, source P2]
+            c2 = c_tgt                          # output channels = target channels
+            args = [c_src, c_tgt, *args]        # YAML args may add use_hpf=False for ablation
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
