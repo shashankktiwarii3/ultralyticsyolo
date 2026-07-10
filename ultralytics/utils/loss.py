@@ -1236,6 +1236,7 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+    
 
 def wasserstein_similarity(pred: torch.Tensor, target: torch.Tensor, C: float = 12.8) -> torch.Tensor:
     """Normalized Wasserstein similarity between xyxy boxes (Xu et al., AI-TOD).
@@ -1250,6 +1251,28 @@ def wasserstein_similarity(pred: torch.Tensor, target: torch.Tensor, C: float = 
     tw, th = target[:, 2] - target[:, 0], target[:, 3] - target[:, 1]
     w2 = (pcx - tcx) ** 2 + (pcy - tcy) ** 2 + ((pw - tw) / 2) ** 2 + ((ph - th) / 2) ** 2
     return torch.exp(-torch.sqrt(w2.clamp(min=1e-7)) / C)
+
+
+
+class WassersteinAlignedAssigner(TaskAlignedAssigner):
+    """TAL assigner whose geometric term blends IoU with Normalized Wasserstein similarity.
+
+    Improves WHICH single anchor is selected for tiny GTs (IoU is near-zero and noisy at
+    sub-16px, so vanilla selection is dominated by classification). topk/topk2 unchanged
+    -> still one positive per GT under the O2O head -> NMS-free preserved.
+    """
+
+    def __init__(self, *args, nwd_C: float = 24.0, nwd_beta: float = 0.5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nwd_C = nwd_C          # set to your measured value from Part 1
+        self.nwd_beta = nwd_beta    # blend: 0 = pure IoU, 1 = pure NWD
+
+    def iou_calculation(self, gt_bboxes, pd_bboxes):
+        iou = super().iou_calculation(gt_bboxes, pd_bboxes)          # (b, n_max, h*w)
+        nwd = wasserstein_similarity(
+            pd_bboxes.reshape(-1, 4), gt_bboxes.reshape(-1, 4), C=self.nwd_C
+        ).view_as(iou)
+        return (1 - self.nwd_beta) * iou + self.nwd_beta * nwd
 
 
 class FoveaBboxLoss(BboxLoss):
@@ -1267,49 +1290,54 @@ class FoveaBboxLoss(BboxLoss):
         self.lam_min, self.lam_max = lam_min, lam_max
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes,
-                target_scores, target_scores_sum, fg_mask, imgsz, stride):
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-
-        # Pixel-space boxes for scale-consistent NWD (inputs are in grid units).
-        s_fg = stride.squeeze(-1).unsqueeze(0).expand(fg_mask.shape[0], -1)[fg_mask].unsqueeze(-1)
-        pred_px, tgt_px = pred_bboxes[fg_mask] * s_fg, target_bboxes[fg_mask] * s_fg
-
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        nwd = wasserstein_similarity(pred_px, tgt_px, C=self.nwd_C).unsqueeze(-1)
-
-        # Size-adaptive blend: side length relative to tiny_px reference.
-        side = ((tgt_px[:, 2] - tgt_px[:, 0]) * (tgt_px[:, 3] - tgt_px[:, 1])).clamp(min=1.0).sqrt()
-        lam = (side / self.tiny_px).clamp(self.lam_min, self.lam_max).unsqueeze(-1)
-
-        loss_iou = ((1.0 - (lam * iou + (1.0 - lam) * nwd)) * weight).sum() / target_scores_sum
-
-        # DFL-free L1 branch: identical to parent (reg_max=1 path).
-        target_ltrb = bbox2dist(anchor_points, target_bboxes)
-        target_ltrb = target_ltrb * stride
-        target_ltrb[..., 0::2] /= imgsz[1]; target_ltrb[..., 1::2] /= imgsz[0]
-        pred_dist = pred_dist * stride
-        pred_dist[..., 0::2] /= imgsz[1]; pred_dist[..., 1::2] /= imgsz[0]
-        loss_dfl = (F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask],
-                              reduction="none").mean(-1, keepdim=True) * weight)
-        loss_dfl = loss_dfl.sum() / target_scores_sum
-        return loss_iou, loss_dfl
+                   target_scores, target_scores_sum, fg_mask, imgsz, stride):
+           weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+    
+           # Pixel-space boxes for scale-consistent NWD (inputs are grid-unit).
+           pred_px = (pred_bboxes * stride)[fg_mask]      # (n_fg, 4) pixels
+           tgt_px  = (target_bboxes * stride)[fg_mask]    # (n_fg, 4) pixels
+    
+           iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+           nwd = wasserstein_similarity(pred_px, tgt_px, C=self.nwd_C).unsqueeze(-1)
+    
+           side = ((tgt_px[:, 2] - tgt_px[:, 0]) * (tgt_px[:, 3] - tgt_px[:, 1])).clamp(min=1.0).sqrt()
+           lam = (side / self.tiny_px).clamp(self.lam_min, self.lam_max).unsqueeze(-1)
+    
+           loss_iou = ((1.0 - (lam * iou + (1.0 - lam) * nwd)) * weight).sum() / target_scores_sum
+    
+           # DFL-free L1 branch (reg_max=1).
+           target_ltrb = bbox2dist(anchor_points, target_bboxes)
+           target_ltrb = target_ltrb * stride
+           target_ltrb[..., 0::2] /= imgsz[1]; target_ltrb[..., 1::2] /= imgsz[0]
+           pred_dist = pred_dist * stride
+           pred_dist[..., 0::2] /= imgsz[1]; pred_dist[..., 1::2] /= imgsz[0]
+           loss_dfl = (F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask],
+                                 reduction="none").mean(-1, keepdim=True) * weight)
+           loss_dfl = loss_dfl.sum() / target_scores_sum
+           return loss_iou, loss_dfl
 
 
 class FoveaDetectionLoss(v8DetectionLoss):
-    """v8DetectionLoss with the NWD-blended box loss. Assignment untouched (topk2 stays fixed)."""
-
-    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+    def __init__(self, model, tal_topk=10, tal_topk2=None,
+                 use_wasserstein_assign=False, nwd_C=24.0):
         super().__init__(model, tal_topk, tal_topk2)
-        self.bbox_loss = FoveaBboxLoss(self.reg_max).to(self.device)
+        self.bbox_loss = FoveaBboxLoss(self.reg_max, nwd_C=nwd_C).to(self.device)  # <-- pass it
+        if use_wasserstein_assign:
+            self.assigner = WassersteinAlignedAssigner(
+                topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0,
+                stride=self.stride.tolist(), topk2=tal_topk2, nwd_C=nwd_C,
+            )
 
 
 class FoveaE2ELoss(E2ELoss):
-    """Standard progressive E2E loss with Fovea box loss on both branches.
+    def __init__(self, model, nwd_C=24.0, use_nwd_loss=True, use_wass_assign=True):
+        # O2M: dense teacher. Use Fovea loss only if testing (A).
+        o2m_fn = FoveaDetectionLoss if use_nwd_loss else v8DetectionLoss
+        super().__init__(model, loss_fn=o2m_fn)
+        # O2O: apply (A) and/or (B) per the switches.
+        if use_nwd_loss or use_wass_assign:
+            self.one2one = FoveaDetectionLoss(
+                model, tal_topk=7, tal_topk2=1,
+                use_wasserstein_assign=use_wass_assign, nwd_C=nwd_C,
+            )
 
-    o2o keeps tal_topk2=1: exactly one positive per GT, preserving NMS-free inference.
-    All densification of tiny-object supervision is via the loss metric, never via
-    positive-count inflation.
-    """
-
-    def __init__(self, model):
-        super().__init__(model, loss_fn=FoveaDetectionLoss)
