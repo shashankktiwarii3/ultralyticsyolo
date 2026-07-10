@@ -1253,27 +1253,27 @@ def wasserstein_similarity(pred: torch.Tensor, target: torch.Tensor, C: float = 
     return torch.exp(-torch.sqrt(w2.clamp(min=1e-7)) / C)
 
 
-
 class WassersteinAlignedAssigner(TaskAlignedAssigner):
-    """TAL assigner whose geometric term blends IoU with Normalized Wasserstein similarity.
+    """TAL assigner that lifts the alignment metric for tiny GTs via NWD, without ever
+    degrading it for normal-sized boxes.
 
-    Improves WHICH single anchor is selected for tiny GTs (IoU is near-zero and noisy at
-    sub-16px, so vanilla selection is dominated by classification). topk/topk2 unchanged
-    -> still one positive per GT under the O2O head -> NMS-free preserved.
+    Uses max(IoU, NWD) rather than a weighted blend: IoU stays fully in control of
+    selection, and NWD only raises the metric where it exceeds IoU (i.e. sub-16px boxes
+    where IoU is near-zero and noisy). This cannot starve the O2O head of positives the
+    way a weighted blend can, because the geometric term is never reduced below IoU.
+    topk/topk2 unchanged -> one positive per GT -> NMS-free preserved.
     """
 
-    def __init__(self, *args, nwd_C: float = 24.0, nwd_beta: float = 0.5, **kwargs):
+    def __init__(self, *args, nwd_C: float = 19.0, **kwargs):
         super().__init__(*args, **kwargs)
-        self.nwd_C = nwd_C          # set to your measured value from Part 1
-        self.nwd_beta = nwd_beta    # blend: 0 = pure IoU, 1 = pure NWD
+        self.nwd_C = nwd_C   # NWD scale (VisDrone mean GT side ≈ 19px)
 
     def iou_calculation(self, gt_bboxes, pd_bboxes):
-        iou = super().iou_calculation(gt_bboxes, pd_bboxes)          # (b, n_max, h*w)
+        iou = super().iou_calculation(gt_bboxes, pd_bboxes)               # (b, n_max, h*w)
         nwd = wasserstein_similarity(
             pd_bboxes.reshape(-1, 4), gt_bboxes.reshape(-1, 4), C=self.nwd_C
         ).view_as(iou)
-        return (1 - self.nwd_beta) * iou + self.nwd_beta * nwd
-
+        return torch.maximum(iou, nwd)
 
 class FoveaBboxLoss(BboxLoss):
     """BboxLoss with a size-adaptive blend of CIoU and Normalized Wasserstein similarity.
@@ -1317,21 +1317,19 @@ class FoveaBboxLoss(BboxLoss):
            loss_dfl = loss_dfl.sum() / target_scores_sum
            return loss_iou, loss_dfl
 
-
 class FoveaDetectionLoss(v8DetectionLoss):
     def __init__(self, model, tal_topk=10, tal_topk2=None,
                  use_wasserstein_assign=False, nwd_C=19.0):
         super().__init__(model, tal_topk, tal_topk2)
-        self.bbox_loss = FoveaBboxLoss(self.reg_max, nwd_C=nwd_C).to(self.device)  # <-- pass it
+        self.bbox_loss = FoveaBboxLoss(self.reg_max, nwd_C=nwd_C).to(self.device)
         if use_wasserstein_assign:
             self.assigner = WassersteinAlignedAssigner(
                 topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0,
                 stride=self.stride.tolist(), topk2=tal_topk2, nwd_C=nwd_C,
             )
 
-
 class FoveaE2ELoss(E2ELoss):
-    def __init__(self, model, nwd_C=19.0, use_nwd_loss=False, use_wass_assign=False):
+    def __init__(self, model, nwd_C=19.0, use_nwd_loss=True, use_wass_assign=True):
         # O2M: dense teacher. Use Fovea loss only if testing (A).
         o2m_fn = FoveaDetectionLoss if use_nwd_loss else v8DetectionLoss
         super().__init__(model, loss_fn=o2m_fn)
