@@ -142,6 +142,7 @@ class Detect(nn.Module):
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 <<<<<<< HEAD
+<<<<<<< HEAD
 
         c2_periodic = max(16, ch[0] // 4)
         self.periodic_cv2 = nn.ModuleList(
@@ -150,12 +151,18 @@ class Detect(nn.Module):
 =======
         self.sgda = nn.ModuleList(SGDA(x) for x in ch)
 >>>>>>> parent of 11d9d8c (run)
+=======
+        self.sgda = nn.ModuleList(SGDA(x) for x in ch)
+>>>>>>> parent of 11d9d8c (run)
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
 <<<<<<< HEAD
+<<<<<<< HEAD
             self.one2one_periodic_cv2 = copy.deepcopy(self.periodic_cv2)
+=======
+>>>>>>> parent of 11d9d8c (run)
 =======
 >>>>>>> parent of 11d9d8c (run)
 

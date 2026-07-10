@@ -1257,6 +1257,7 @@ class TVPSegmentLoss(TVPDetectLoss):
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
 <<<<<<< HEAD
+<<<<<<< HEAD
 
 
 class DensityAwarev8DetectionLoss(v8DetectionLoss):
@@ -1319,5 +1320,7 @@ class DensityAwareE2ELoss(E2ELoss):
     def __init__(self, model):
         super().__init__(model, loss_fn=v8DetectionLoss)          # o2m stays standard
         self.one2one = DensityAwarev8DetectionLoss(model, tal_topk=7, tal_topk2=1)
+=======
+>>>>>>> parent of 11d9d8c (run)
 =======
 >>>>>>> parent of 11d9d8c (run)
