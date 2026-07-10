@@ -109,28 +109,24 @@ class Detect(nn.Module):
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
-        # --- YOLO26-Fovea: periodic sub-pixel residual branch ---
         c2_periodic = max(16, ch[0] // 4)
         self.periodic_cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2_periodic, 1), nn.Conv2d(c2_periodic, 4 * self.reg_max, 1)) for x in ch
         )
-        for seq in self.periodic_cv2:                 # start as identity: residual == 0 at init
-            nn.init.zeros_(seq[-1].weight)
-            nn.init.zeros_(seq[-1].bias)
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
-            self.one2one_periodic_cv2 = copy.deepcopy(self.periodic_cv2)  # inherits the zeros
+            self.one2one_periodic_cv2 = copy.deepcopy(self.periodic_cv2)
 
     @property
     def one2many(self):
-        """One-to-many head components."""
+        """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
         return dict(box_head=self.cv2, cls_head=self.cv3, periodic_head=self.periodic_cv2)
 
     @property
     def one2one(self):
-        """One-to-one head components."""
+        """Returns the one-to-one head components."""
         return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, periodic_head=self.one2one_periodic_cv2)
 
     @property
@@ -143,18 +139,23 @@ class Detect(nn.Module):
         """Override the end-to-end detection mode."""
         self._end2end = value
 
-    def forward_head(self, x, box_head=None, cls_head=None, periodic_head=None):
-        """Concatenate and return predicted boxes (with sub-pixel residual) and class scores."""
-        if box_head is None or cls_head is None:  # fused inference
+    def forward_head(
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None, periodic_head: torch.nn.Module = None
+    ) -> dict[str, torch.Tensor]:
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if box_head is None or cls_head is None:  # for fused inference
             return dict()
-        bs = x[0].shape[0]
+        bs = x[0].shape[0]  # batch size
+        
+        # Base linear distance prediction
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        
+        # --- YOLO26-Fovea: Add Periodic Sub-Pixel Residual ---
         if periodic_head is not None:
-            residual = torch.cat(
-                [periodic_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
-            )
-            # bounded, monotonic sub-pixel residual in (-0.5, 0.5) grid units
-            boxes = boxes + 0.5 * torch.sin(torch.tanh(residual) * (math.pi / 2))
+            periodic_res = torch.cat([periodic_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+            # Sine activation provides bounded, highly sensitive sub-pixel adjustments
+            boxes = boxes + torch.sin(periodic_res) * 0.5  
+            
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
         return dict(boxes=boxes, scores=scores, feats=x)
 
@@ -262,7 +263,7 @@ class Detect(nn.Module):
         return scores[..., None], (index % nc)[..., None].float(), idx
 
     def fuse(self) -> None:
-        """Remove the one2many head (including its periodic branch) for inference optimization."""
+        """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = self.periodic_cv2 = None
 
 
