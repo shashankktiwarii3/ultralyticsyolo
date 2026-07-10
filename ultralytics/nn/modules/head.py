@@ -23,6 +23,39 @@ from .utils import bias_init_with_prob, linear_init
 __all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
+class SGDA(nn.Module):
+    """Sub-Grid Deformable Alignment for Tiny Objects.
+    Learns sub-pixel offsets to shift receptive fields toward tiny objects, 
+    fixing grid-quantization errors for the NMS-Free E2E head.
+    """
+    def __init__(self, c1: int):
+        super().__init__()
+        self.offset_conv = nn.Conv2d(c1, 2, 1, 1)
+        nn.init.zeros_(self.offset_conv.weight)
+        nn.init.zeros_(self.offset_conv.bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Predict offsets bounded to [-0.5, 0.5] pixels
+        offset = self.offset_conv(x).tanh() * 0.5 
+        B, C, H, W = x.shape
+        
+        # Create normalized base grid [-1, 1]
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype),
+            torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype),
+            indexing='ij'
+        )
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
+        
+        # Normalize pixel offsets to grid space [-1, 1]
+        offset_norm = offset.permute(0, 2, 3, 1)
+        offset_norm[..., 0] = offset_norm[..., 0] * (2.0 / W)
+        offset_norm[..., 1] = offset_norm[..., 1] * (2.0 / H)
+        
+        final_grid = grid + offset_norm
+        return F.grid_sample(x, final_grid, mode='bilinear', padding_mode='border', align_corners=True)
+
+
 class Detect(nn.Module):
     """YOLO Detect head for object detection models.
 
@@ -108,26 +141,33 @@ class Detect(nn.Module):
             )
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+<<<<<<< HEAD
 
         c2_periodic = max(16, ch[0] // 4)
         self.periodic_cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2_periodic, 1), nn.Conv2d(c2_periodic, 4 * self.reg_max, 1)) for x in ch
         )
+=======
+        self.sgda = nn.ModuleList(SGDA(x) for x in ch)
+>>>>>>> parent of 11d9d8c (run)
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+<<<<<<< HEAD
             self.one2one_periodic_cv2 = copy.deepcopy(self.periodic_cv2)
+=======
+>>>>>>> parent of 11d9d8c (run)
 
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
-        return dict(box_head=self.cv2, cls_head=self.cv3, periodic_head=self.periodic_cv2)
+        return dict(box_head=self.cv2, cls_head=self.cv3)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, periodic_head=self.one2one_periodic_cv2)
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
 
     @property
     def end2end(self):
@@ -140,22 +180,14 @@ class Detect(nn.Module):
         self._end2end = value
 
     def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None, periodic_head: torch.nn.Module = None
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         if box_head is None or cls_head is None:  # for fused inference
             return dict()
+        x = [self.sgda[i](x[i]) for i in range(self.nl)]
         bs = x[0].shape[0]  # batch size
-        
-        # Base linear distance prediction
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-        
-        # --- YOLO26-Fovea: Add Periodic Sub-Pixel Residual ---
-        if periodic_head is not None:
-            periodic_res = torch.cat([periodic_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-            # Sine activation provides bounded, highly sensitive sub-pixel adjustments
-            boxes = boxes + torch.sin(periodic_res) * 0.5  
-            
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
         return dict(boxes=boxes, scores=scores, feats=x)
 
@@ -264,7 +296,7 @@ class Detect(nn.Module):
 
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.periodic_cv2 = None
+        self.cv2 = self.cv3 = None
 
 
 class Segment(Detect):

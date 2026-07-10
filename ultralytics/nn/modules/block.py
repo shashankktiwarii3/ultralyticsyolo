@@ -3387,6 +3387,7 @@ class HFRA(nn.Module):
         attn = self.act(self.fusion(x_cat)).permute(0, 3, 1, 2)
         
         out = x_base * attn
+<<<<<<< HEAD
         return out + x if self.add else out
 
 # class HighFreqInject(nn.Module):
@@ -3475,3 +3476,6 @@ class HighFreqInject(nn.Module):
         target, source = x[0], x[1]
         edges = self.laplacian(source)
         return target + self.proj(edges)
+=======
+        return out + x if self.add else out
+>>>>>>> parent of 11d9d8c (run)

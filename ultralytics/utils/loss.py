@@ -1158,7 +1158,27 @@ class E2ELoss:
         one2many, one2one = preds["one2many"], preds["one2one"]
         loss_one2many = self.one2many.loss(one2many, batch)
         loss_one2one = self.one2one.loss(one2one, batch)
-        return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
+        
+        # --- YOLO26-FR: Density-Masked Progressive Loss (DM-PL) ---
+        # Calculate tiny object ratio in the current batch
+        gt_bboxes = batch["bboxes"] # normalized xywh
+        if gt_bboxes.shape[0] > 0:
+            areas = gt_bboxes[:, 2] * gt_bboxes[:, 3]
+            # Threshold for tiny objects (~16x16 in 640x640 image)
+            tiny_ratio = (areas < 0.001).float().mean() 
+        else:
+            tiny_ratio = 0.0
+            
+        # If in early training (first 20%) and batch is dense with tiny objects, 
+        # downweight the One-to-One loss to prevent gradient instability.
+        total_steps = max(self.one2one.hyp.epochs * 100, 1) # Rough estimate of steps
+        if self.updates < (total_steps * 0.2) and tiny_ratio > 0.3:
+            o2o_weight = 0.1 * self.o2o  # Heavily downweight E2E head
+        else:
+            o2o_weight = self.o2o
+        # --------------------------------------------------------
+
+        return loss_one2many[0] * self.o2m + loss_one2one[0] * o2o_weight, loss_one2one[1]
 
     def update(self) -> None:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""
@@ -1236,6 +1256,7 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+<<<<<<< HEAD
 
 
 class DensityAwarev8DetectionLoss(v8DetectionLoss):
@@ -1298,3 +1319,5 @@ class DensityAwareE2ELoss(E2ELoss):
     def __init__(self, model):
         super().__init__(model, loss_fn=v8DetectionLoss)          # o2m stays standard
         self.one2one = DensityAwarev8DetectionLoss(model, tal_topk=7, tal_topk2=1)
+=======
+>>>>>>> parent of 11d9d8c (run)

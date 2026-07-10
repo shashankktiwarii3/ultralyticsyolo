@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import FASA, MuTOA, C2TSMA, TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
+from ultralytics.nn.modules.block import FASA, MuTOA, C2TSMA, TSMA, C2PSA, C2MSDPRA, MSDPRABlock, MSDPRA,WGCA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -78,7 +78,6 @@ from ultralytics.nn.modules import (
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
-    DensityAwareE2ELoss,
     E2ELoss,
     PoseLoss26,
     v8ClassificationLoss,
