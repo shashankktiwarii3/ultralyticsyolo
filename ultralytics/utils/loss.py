@@ -1331,7 +1331,7 @@ class FoveaDetectionLoss(v8DetectionLoss):
 
 
 class FoveaE2ELoss(E2ELoss):
-    def __init__(self, model, nwd_C=19.0, use_nwd_loss=True, use_wass_assign=False):
+    def __init__(self, model, nwd_C=19.0, use_nwd_loss=False, use_wass_assign=False):
         # O2M: dense teacher. Use Fovea loss only if testing (A).
         o2m_fn = FoveaDetectionLoss if use_nwd_loss else v8DetectionLoss
         super().__init__(model, loss_fn=o2m_fn)
