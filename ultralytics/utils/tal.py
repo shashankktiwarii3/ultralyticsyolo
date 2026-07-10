@@ -60,31 +60,12 @@ class TaskAlignedAssigner(nn.Module):
         self.eps = eps
 
     @torch.no_grad()
-    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
-        """Compute the task-aligned assignment.
-
-        Args:
-            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
-            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
-            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
-            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
-            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
-            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
-
-        Returns:
-            target_labels (torch.Tensor): Target labels with shape (bs, num_total_anchors).
-            target_bboxes (torch.Tensor): Target bounding boxes with shape (bs, num_total_anchors, 4).
-            target_scores (torch.Tensor): Target scores with shape (bs, num_total_anchors, num_classes).
-            fg_mask (torch.Tensor): Foreground mask with shape (bs, num_total_anchors).
-            target_gt_idx (torch.Tensor): Target ground truth indices with shape (bs, num_total_anchors).
-
-        References:
-            https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py
-        """
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, topk2_per_image=None):
+        """Compute the task-aligned assignment with optional per-image density-aware topk2."""
         self.bs = pd_scores.shape[0]
         self.n_max_boxes = gt_bboxes.shape[1]
         device = gt_bboxes.device
-
+        
         if self.n_max_boxes == 0:
             return (
                 torch.full_like(pd_scores[..., 0], self.num_classes),
@@ -93,80 +74,54 @@ class TaskAlignedAssigner(nn.Module):
                 torch.zeros_like(pd_scores[..., 0]),
                 torch.zeros_like(pd_scores[..., 0]),
             )
-
+        
         try:
-            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, topk2_per_image)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                # Move tensors to CPU, compute, then move back to original device
                 LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
                 cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
-                result = self._forward(*cpu_tensors)
+                cpu_topk2 = topk2_per_image.cpu() if topk2_per_image is not None else None
+                result = self._forward(*cpu_tensors, cpu_topk2)
                 return tuple(t.to(device) for t in result)
             raise
 
-    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
-        """Compute the task-aligned assignment.
-
-        Args:
-            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
-            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
-            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
-            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
-            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
-            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
-
-        Returns:
-            target_labels (torch.Tensor): Target labels with shape (bs, num_total_anchors).
-            target_bboxes (torch.Tensor): Target bounding boxes with shape (bs, num_total_anchors, 4).
-            target_scores (torch.Tensor): Target scores with shape (bs, num_total_anchors, num_classes).
-            fg_mask (torch.Tensor): Foreground mask with shape (bs, num_total_anchors).
-            target_gt_idx (torch.Tensor): Target ground truth indices with shape (bs, num_total_anchors).
-        """
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, topk2_per_image=None):
+        """Compute task-aligned assignment with optional per-image topk2."""
         mask_pos, align_metric, overlaps = self.get_pos_mask(
             pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
         )
-
         target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(
-            mask_pos, overlaps, self.n_max_boxes, align_metric
+            mask_pos, overlaps, self.n_max_boxes, align_metric, topk2_per_image
         )
-
-        # Assigned target
-        target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
-
-        # Normalize
+        
+        target_labels, target_bboxes, target_scores = self.get_targets(
+            gt_labels, gt_bboxes, target_gt_idx, fg_mask
+        )
+        
         align_metric *= mask_pos
-        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)  # b, max_num_obj
-        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
+        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)
+        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
         target_scores = target_scores * norm_align_metric
-
+        
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
-
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
-        """Get positive mask for each ground truth box.
-
-        Args:
-            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
-            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
-            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
-            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
-            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
-            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
-
-        Returns:
-            mask_pos (torch.Tensor): Positive mask with shape (bs, max_num_obj, h*w).
-            align_metric (torch.Tensor): Alignment metric with shape (bs, max_num_obj, h*w).
-            overlaps (torch.Tensor): Overlaps between predicted vs ground truth boxes with shape (bs, max_num_obj, h*w).
-        """
+        """Get positive mask for each ground truth box with optional per-image density-aware topk2."""
         mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
+        
         # Get anchor_align metric, (b, max_num_obj, h*w)
-        align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
-        # Get topk_metric mask, (b, max_num_obj, h*w)
-        mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
-        # Merge all mask to a final mask, (b, max_num_obj, h*w)
+        align_metric, overlaps = self.get_box_metrics(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt
+        )
+        
+        # Get topk_metric mask using primary topk, (b, max_num_obj, h*w)
+        mask_topk = self.select_topk_candidates(
+            align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool()
+        )
+        
+        # Merge all masks, (b, max_num_obj, h*w)
         mask_pos = mask_topk * mask_in_gts * mask_gt
-
         return mask_pos, align_metric, overlaps
 
     def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
@@ -214,35 +169,63 @@ class TaskAlignedAssigner(nn.Module):
         """
         return bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
 
-    def select_topk_candidates(self, metrics, topk_mask=None):
+    def select_topk_candidates(self, metrics, topk_mask=None, topk_values=None):
         """Select the top-k candidates based on the given metrics.
-
+        
         Args:
-            metrics (torch.Tensor): A tensor of shape (b, max_num_obj, h*w), where b is the batch size, max_num_obj is
-                the maximum number of objects, and h*w represents the total number of anchor points.
-            topk_mask (torch.Tensor, optional): An optional boolean tensor of shape (b, max_num_obj, topk), where topk
-                is the number of top candidates to consider. If not provided, the top-k values are automatically
-                computed based on the given metrics.
-
+            metrics: (b, max_num_obj, h*w) tensor of alignment scores
+            topk_mask: Optional (b, max_num_obj, topk) bool tensor - legacy path
+            topk_values: Optional (b,) tensor of per-image topk values - new density-aware path
+        
         Returns:
-            (torch.Tensor): A tensor of shape (b, max_num_obj, h*w) containing the selected top-k candidates.
+            count_tensor: (b, max_num_obj, h*w) binary mask of selected anchors
         """
-        # (b, max_num_obj, topk)
+        if topk_values is not None:
+            # --- DENSITY-AWARE PER-IMAGE TOPK PATH ---
+            max_topk = int(topk_values.max().item())
+            
+            # Get full top-k indices using the max value
+            # Shape: (b, max_num_obj, max_topk)
+            topk_metrics, topk_idxs = torch.topk(metrics, max_topk, dim=-1, largest=True)
+            
+            # Create validity mask for GT boxes (must have positive alignment)
+            # Shape: (b, max_num_obj, max_topk)
+            valid_gt = topk_metrics.max(-1, keepdim=True)[0] > self.eps  # (b, max_num_obj, 1)
+            valid_k = topk_values[:, None, None]  # (b, 1, 1)
+            
+            # Position indices: 0, 1, 2, ..., max_topk-1
+            k_indices = torch.arange(max_topk, device=metrics.device)[None, None, :]  # (1, 1, max_topk)
+            
+            # Valid if: GT is valid AND position < this image's topk value
+            topk_mask = valid_gt & (k_indices < valid_k)  # (b, max_num_obj, max_topk)
+            topk_idxs.masked_fill_(~topk_mask, 0)
+            
+            # Scatter into full tensor to create binary selection mask
+            count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=metrics.device)
+            ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8, device=metrics.device)
+            
+            # Process all valid GTs simultaneously using masked scatter
+            for k in range(max_topk):
+                valid_at_k = topk_mask[:, :, k:k+1]  # (b, max_num_obj, 1)
+                if not valid_at_k.any():
+                    continue
+                indices_at_k = topk_idxs[:, :, k:k+1]  # (b, max_num_obj, 1)
+                count_tensor.scatter_add_(-1, indices_at_k, (ones * valid_at_k.int()).to(count_tensor.dtype))
+            
+            count_tensor.masked_fill_(count_tensor > 1, 0)
+            return count_tensor.to(metrics.dtype)
+        
+        # --- ORIGINAL FIXED-TOPK PATH (fallback) ---
         topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=True)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
-        # (b, max_num_obj, topk)
         topk_idxs.masked_fill_(~topk_mask, 0)
-
-        # (b, max_num_obj, topk, h*w) -> (b, max_num_obj, h*w)
+        
         count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=topk_idxs.device)
         ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8, device=topk_idxs.device)
         for k in range(self.topk):
-            # Expand topk_idxs for each value of k and add 1 at the specified positions
-            count_tensor.scatter_add_(-1, topk_idxs[:, :, k : k + 1], ones)
-        # Filter invalid bboxes
+            count_tensor.scatter_add_(-1, topk_idxs[:, :, k:k+1], ones)
         count_tensor.masked_fill_(count_tensor > 1, 0)
-
         return count_tensor.to(metrics.dtype)
 
     def get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask):
@@ -317,41 +300,59 @@ class TaskAlignedAssigner(nn.Module):
         bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
         return bbox_deltas.amin(3).gt_(eps)
 
-    def select_highest_overlaps(self, mask_pos, overlaps, n_max_boxes, align_metric):
-        """Select anchor boxes with highest IoU when assigned to multiple ground truths.
-
-        Args:
-            mask_pos (torch.Tensor): Positive mask, shape (b, n_max_boxes, h*w).
-            overlaps (torch.Tensor): IoU overlaps, shape (b, n_max_boxes, h*w).
-            n_max_boxes (int): Maximum number of ground truth boxes.
-            align_metric (torch.Tensor): Alignment metric for selecting best matches.
-
-        Returns:
-            target_gt_idx (torch.Tensor): Indices of assigned ground truths, shape (b, h*w).
-            fg_mask (torch.Tensor): Foreground mask, shape (b, h*w).
-            mask_pos (torch.Tensor): Updated positive mask, shape (b, n_max_boxes, h*w).
-        """
-        # Convert (b, n_max_boxes, h*w) -> (b, h*w)
+    def select_highest_overlaps(self, mask_pos, overlaps, n_max_boxes, align_metric, topk2_per_image=None):
+        """Select anchor boxes with highest IoU, with per-image density-aware topk2."""
         fg_mask = mask_pos.sum(-2)
-        if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes
-            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)  # (b, n_max_boxes, h*w)
-
-            max_overlaps_idx = overlaps.argmax(1)  # (b, h*w)
+        if fg_mask.max() > 1:
+            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)
+            max_overlaps_idx = overlaps.argmax(1)
             is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
             is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
-            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()  # (b, n_max_boxes, h*w)
-
+            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()
             fg_mask = mask_pos.sum(-2)
-
-        if self.topk2 != self.topk:
-            align_metric = align_metric * mask_pos  # update overlaps
-            max_overlaps_idx = torch.topk(align_metric, self.topk2, dim=-1, largest=True).indices  # (b, n_max_boxes)
-            topk_idx = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)  # update mask_pos
+        
+        # --- PER-IMAGE DENSITY-AWARE TOPK2 PATH ---
+        if topk2_per_image is not None:
+            align_metric = align_metric * mask_pos
+            # For each GT in each image, keep only the top-k2_per_image[b] anchors
+            max_topk2 = int(topk2_per_image.max().item())
+            
+            # Get full sorted indices using max possible topk2
+            _, max_overlaps_idx = torch.topk(
+                align_metric, max_topk2, dim=-1, largest=True
+            )  # (b, max_num_obj, max_topk2)
+            
+            # Build validity mask per-image
+            k_indices = torch.arange(max_topk2, device=mask_pos.device)[None, None, :]  # (1, 1, max_topk2)
+            valid_k = topk2_per_image[:, None, None]  # (b, 1, 1)
+            valid_mask = k_indices < valid_k  # (b, max_num_obj, max_topk2)
+            
+            # Create binary topk2 mask by scattering valid indices
+            topk_idx = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
+            valid_ones = valid_mask.float()  # (b, max_num_obj, max_topk2)
+            
+            # For each k position, scatter the valid ones into topk_idx
+            for k in range(max_topk2):
+                idx_k = max_overlaps_idx[:, :, k:k+1]  # (b, max_num_obj, 1)
+                val_k = valid_ones[:, :, k:k+1]         # (b, max_num_obj, 1)
+                topk_idx.scatter_add_(-1, idx_k, val_k)
+            
+            topk_idx = (topk_idx > 0).float()
+            mask_pos *= topk_idx
+            fg_mask = mask_pos.sum(-2)
+            
+        elif self.topk2 != self.topk:
+            # --- ORIGINAL FIXED TOPK2 PATH ---
+            align_metric = align_metric * mask_pos
+            max_overlaps_idx = torch.topk(
+                align_metric, self.topk2, dim=-1, largest=True
+            ).indices
+            topk_idx = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
             topk_idx.scatter_(-1, max_overlaps_idx, 1.0)
             mask_pos *= topk_idx
             fg_mask = mask_pos.sum(-2)
-        # Find each grid serve which gt(index)
-        target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
+        
+        target_gt_idx = mask_pos.argmax(-2)
         return target_gt_idx, fg_mask, mask_pos
 
 

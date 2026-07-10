@@ -1239,10 +1239,10 @@ class TVPSegmentLoss(TVPDetectLoss):
 
 
 class DensityAwarev8DetectionLoss(v8DetectionLoss):
-    """v8 detection loss with density-conditioned O2O assignment for dense/tiny-object scenes."""
+    """v8 detection loss with density-conditioned per-image topk2 for tiny/dense-object scenes."""
 
-    def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+    def get_assigned_targets_and_loss(self, preds, batch):
+        loss = torch.zeros(3, device=self.device)
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
@@ -1257,12 +1257,15 @@ class DensityAwarev8DetectionLoss(v8DetectionLoss):
         gt_labels, gt_bboxes = targets.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-        # --- density-conditioned topk2 (robust + capped) ---
-        if hasattr(self.assigner, "topk2"):
-            gt_per_image = mask_gt.squeeze(-1).sum(dim=-1).float()   # [bs]
-            density = gt_per_image.median()                          # robust to a single huge frame
-            self.assigner.topk2 = int(min(3, max(1, 1 + (density // 40).item())))
-        # ----------------------------------------------------
+        # --- COMPUTE PER-IMAGE DENSITY-AWARE TOPK2 ---
+        topk2_per_image = None
+        if hasattr(self.assigner, "topk2") and self.assigner.topk2 != self.assigner.topk:
+            # Count GT objects per image: mask_gt shape is (b, max_boxes, 1)
+            gt_per_image = mask_gt.squeeze(-1).sum(dim=-1)  # (b,) tensor
+            
+            # Robust formula using per-image count: topk2 = clamp(1 + count/40, 1, 3)
+            topk2_per_image = (1 + (gt_per_image // 40)).clamp(min=1, max=3).long()  # (b,)
+        # --------------------------------------------------
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
@@ -1272,19 +1275,22 @@ class DensityAwarev8DetectionLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            topk2_per_image=topk2_per_image,  # <-- pass per-image tensor
         )
+        
         target_scores_sum = max(target_scores.sum(), 1)
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        
         if fg_mask.sum():
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes / stride_tensor,
                 target_scores, target_scores_sum, fg_mask, imgsz, stride_tensor,
             )
+        
         loss[0] *= self.hyp.box
         loss[1] *= self.hyp.cls
         loss[2] *= self.hyp.dfl
         return (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), loss, loss.detach()
-
 
 class DensityAwareE2ELoss(E2ELoss):
     """E2E loss that uses the density-aware O2O loss for the one-to-one head."""
