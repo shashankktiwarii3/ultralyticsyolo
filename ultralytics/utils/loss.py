@@ -1236,107 +1236,59 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
-    
-
-def wasserstein_similarity(pred: torch.Tensor, target: torch.Tensor, C: float = 12.8) -> torch.Tensor:
-    """Normalized Wasserstein similarity between xyxy boxes (Xu et al., AI-TOD).
-
-    Boxes are modeled as 2D Gaussians; W2 distance has a closed form and, unlike IoU,
-    degrades smoothly for small/non-overlapping boxes. Inputs must be in PIXEL units.
-    C is a dataset scale constant (≈ mean box size); tune on the target dataset.
-    """
-    pcx, pcy = (pred[:, 0] + pred[:, 2]) / 2, (pred[:, 1] + pred[:, 3]) / 2
-    pw, ph = pred[:, 2] - pred[:, 0], pred[:, 3] - pred[:, 1]
-    tcx, tcy = (target[:, 0] + target[:, 2]) / 2, (target[:, 1] + target[:, 3]) / 2
-    tw, th = target[:, 2] - target[:, 0], target[:, 3] - target[:, 1]
-    w2 = (pcx - tcx) ** 2 + (pcy - tcy) ** 2 + ((pw - tw) / 2) ** 2 + ((ph - th) / 2) ** 2
-    return torch.exp(-torch.sqrt(w2.clamp(min=1e-7)) / C)
 
 
-class WassersteinAlignedAssigner(TaskAlignedAssigner):
-    """TAL assigner that lifts the alignment metric for tiny GTs via NWD, without ever
-    degrading it for normal-sized boxes.
+class DensityAwarev8DetectionLoss(v8DetectionLoss):
+    """v8 detection loss with density-conditioned O2O assignment for dense/tiny-object scenes."""
 
-    Uses max(IoU, NWD) rather than a weighted blend: IoU stays fully in control of
-    selection, and NWD only raises the metric where it exceeds IoU (i.e. sub-16px boxes
-    where IoU is near-zero and noisy). This cannot starve the O2O head of positives the
-    way a weighted blend can, because the geometric term is never reduced below IoU.
-    topk/topk2 unchanged -> one positive per GT -> NMS-free preserved.
-    """
+    def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        pred_distri, pred_scores = (
+            preds["boxes"].permute(0, 2, 1).contiguous(),
+            preds["scores"].permute(0, 2, 1).contiguous(),
+        )
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
 
-    def __init__(self, *args, nwd_C: float = 19.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.nwd_C = nwd_C   # NWD scale (VisDrone mean GT side ≈ 19px)
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-    def iou_calculation(self, gt_bboxes, pd_bboxes):
-        iou = super().iou_calculation(gt_bboxes, pd_bboxes)               # (b, n_max, h*w)
-        nwd = wasserstein_similarity(
-            pd_bboxes.reshape(-1, 4), gt_bboxes.reshape(-1, 4), C=self.nwd_C
-        ).view_as(iou)
-        return torch.maximum(iou, nwd)
+        # --- density-conditioned topk2 (robust + capped) ---
+        if hasattr(self.assigner, "topk2"):
+            gt_per_image = mask_gt.squeeze(-1).sum(dim=-1).float()   # [bs]
+            density = gt_per_image.median()                          # robust to a single huge frame
+            self.assigner.topk2 = int(min(3, max(1, 1 + (density // 40).item())))
+        # ----------------------------------------------------
 
-class FoveaBboxLoss(BboxLoss):
-    """BboxLoss with a size-adaptive blend of CIoU and Normalized Wasserstein similarity.
-
-    Tiny boxes (unreliable IoU gradient) lean on NWD; large boxes keep CIoU.
-    Blend weight lam = clamp(sqrt(box_area / tiny_area_ref), lam_min, lam_max).
-    Zero inference cost. Requires reg_max == 1 path (YOLO26 default).
-    """
-
-    def __init__(self, reg_max: int = 1, nwd_C: float = 12.8,
-                 tiny_px: float = 32.0, lam_min: float = 0.2, lam_max: float = 0.9):
-        super().__init__(reg_max)
-        self.nwd_C, self.tiny_px = nwd_C, tiny_px
-        self.lam_min, self.lam_max = lam_min, lam_max
-
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes,
-                   target_scores, target_scores_sum, fg_mask, imgsz, stride):
-           weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-    
-           # Pixel-space boxes for scale-consistent NWD (inputs are grid-unit).
-           pred_px = (pred_bboxes * stride)[fg_mask]      # (n_fg, 4) pixels
-           tgt_px  = (target_bboxes * stride)[fg_mask]    # (n_fg, 4) pixels
-
-
-           iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-           nwd = wasserstein_similarity(pred_px, tgt_px, C=self.nwd_C).unsqueeze(-1)
-    
-           side = ((tgt_px[:, 2] - tgt_px[:, 0]) * (tgt_px[:, 3] - tgt_px[:, 1])).clamp(min=1.0).sqrt()
-           lam = (side / self.tiny_px).clamp(self.lam_min, self.lam_max).unsqueeze(-1)
-    
-           loss_iou = ((1.0 - (lam * iou + (1.0 - lam) * nwd)) * weight).sum() / target_scores_sum
-    
-           # DFL-free L1 branch (reg_max=1).
-           target_ltrb = bbox2dist(anchor_points, target_bboxes)
-           target_ltrb = target_ltrb * stride
-           target_ltrb[..., 0::2] /= imgsz[1]; target_ltrb[..., 1::2] /= imgsz[0]
-           pred_dist = pred_dist * stride
-           pred_dist[..., 0::2] /= imgsz[1]; pred_dist[..., 1::2] /= imgsz[0]
-           loss_dfl = (F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask],
-                                 reduction="none").mean(-1, keepdim=True) * weight)
-           loss_dfl = loss_dfl.sum() / target_scores_sum
-           return loss_iou, loss_dfl
-
-class FoveaDetectionLoss(v8DetectionLoss):
-    def __init__(self, model, tal_topk=10, tal_topk2=None,
-                 use_wasserstein_assign=False, nwd_C=19.0):
-        super().__init__(model, tal_topk, tal_topk2)
-        self.bbox_loss = FoveaBboxLoss(self.reg_max, nwd_C=nwd_C).to(self.device)
-        if use_wasserstein_assign:
-            self.assigner = WassersteinAlignedAssigner(
-                topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0,
-                stride=self.stride.tolist(), topk2=tal_topk2, nwd_C=nwd_C,
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        if fg_mask.sum():
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes / stride_tensor,
+                target_scores, target_scores_sum, fg_mask, imgsz, stride_tensor,
             )
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        return (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), loss, loss.detach()
 
-class FoveaE2ELoss(E2ELoss):
-    def __init__(self, model, nwd_C=19.0, use_nwd_loss=True, use_wass_assign=True):
-        # O2M: dense teacher. Use Fovea loss only if testing (A).
-        o2m_fn = FoveaDetectionLoss if use_nwd_loss else v8DetectionLoss
-        super().__init__(model, loss_fn=o2m_fn)
-        # O2O: apply (A) and/or (B) per the switches.
-        if use_nwd_loss or use_wass_assign:
-            self.one2one = FoveaDetectionLoss(
-                model, tal_topk=7, tal_topk2=1,
-                use_wasserstein_assign=use_wass_assign, nwd_C=nwd_C,
-            )
 
+class DensityAwareE2ELoss(E2ELoss):
+    """E2E loss that uses the density-aware O2O loss for the one-to-one head."""
+
+    def __init__(self, model):
+        super().__init__(model, loss_fn=v8DetectionLoss)          # o2m stays standard
+        self.one2one = DensityAwarev8DetectionLoss(model, tal_topk=7, tal_topk2=1)

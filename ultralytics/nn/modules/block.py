@@ -3421,36 +3421,17 @@ class HFRA(nn.Module):
 
 
 class HighFreqInject(nn.Module):
-    """Inject high-frequency detail from a high-res source map (P2) into a lower-res target map (P3).
+    """Inject high-frequency detail from a higher-res map (P2) into a lower-res map (P3)."""
 
-    Frozen Laplacian high-pass extracts edges; a strided projection aligns channels and
-    spatial size; the result is added to the target. Runs in native dtype (AMP-friendly).
-
-    Args:
-        c_src (int): source (P2) channels.
-        c_tgt (int): target (P3) channels.
-        use_hpf (bool): if False, bypass the Laplacian (ablation control: same params, no filter).
-    """
-
-    def __init__(self, c_src: int, c_tgt: int, use_hpf: bool = True):
+    def __init__(self, c1, c2):
+        # c1 = source channels (P2), c2 = target channels (P3 concat)
         super().__init__()
-        self.use_hpf = use_hpf
-        if use_hpf:
-            lap = torch.tensor([[0.0, 1.0, 0.0],
-                                [1.0, -4.0, 1.0],
-                                [0.0, 1.0, 0.0]])
-            # Buffer, not Parameter: excluded from MuSGD/optimizer param groups by construction,
-            # still saved in state_dict and moved by .to()/.half()/.cuda() automatically.
-            self.register_buffer("lap_kernel", lap.view(1, 1, 3, 3).repeat(c_src, 1, 1, 1))
-        self.proj = Conv(c_src, c_tgt, k=3, s=2)  # channel align + 2x downsample (P2 -> P3)
+        self.c1 = c1
+        kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]).view(1, 1, 3, 3)
+        self.register_buffer("lap", kernel.repeat(c1, 1, 1, 1))   # frozen, invisible to optimizer/MuSGD
+        self.proj = Conv(c1, c2, k=3, s=2)                        # 160->80, align channels to target
 
-    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
-        tgt, src = x[0], x[1]  # x = [P3 target, P2 source]
-        if self.use_hpf:
-            # Native-dtype depthwise high-pass: the buffer follows src's dtype under AMP,
-            # so no fp32 upcast of the large P2 map. Matches the original memory footprint.
-            edges = F.conv2d(src, self.lap_kernel.to(src.dtype), padding=1,
-                             groups=self.lap_kernel.shape[0])
-        else:
-            edges = src  # ablation control: plain parameterized skip
-        return tgt + self.proj(edges)
+    def forward(self, x):
+        target, source = x[0], x[1]                               # x[0]=P3 (target), x[1]=P2 (source)
+        edges = F.conv2d(source, self.lap, padding=1, groups=self.c1)
+        return target + self.proj(edges)

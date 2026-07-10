@@ -109,30 +109,29 @@ class Detect(nn.Module):
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
-        # --- YOLO26-Fovea: Bounded Residual Refinement (BRR) branch ---
-        # Adds a bounded correction to the direct-regression distances (reg_max=1).
-        # Correction is in grid-cell units: image-space amplitude = brr_gain * stride px,
-        # i.e. scale-proportional across P3/P4/P5 by construction.
-        self.brr_act = getattr(self, "brr_act", "sin")   # "sin" | "tanh" | "linear" (ablation)
-        self.brr_gain = getattr(self, "brr_gain", 0.5)   # max correction, in grid cells
-        c2r = max(16, ch[0] // 4)
-        self.brr = nn.ModuleList(
-            nn.Sequential(Conv(x, c2r, 1), nn.Conv2d(c2r, 4 * self.reg_max, 1)) for x in ch
+        # --- YOLO26-Fovea: periodic sub-pixel residual branch ---
+        c2_periodic = max(16, ch[0] // 4)
+        self.periodic_cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2_periodic, 1), nn.Conv2d(c2_periodic, 4 * self.reg_max, 1)) for x in ch
         )
+        for seq in self.periodic_cv2:                 # start as identity: residual == 0 at init
+            nn.init.zeros_(seq[-1].weight)
+            nn.init.zeros_(seq[-1].bias)
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
-            self.one2one_brr = copy.deepcopy(self.brr)
+            self.one2one_periodic_cv2 = copy.deepcopy(self.periodic_cv2)  # inherits the zeros
 
     @property
     def one2many(self):
-        return dict(box_head=self.cv2, cls_head=self.cv3, brr_head=self.brr)
+        """One-to-many head components."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, periodic_head=self.periodic_cv2)
 
     @property
     def one2one(self):
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
-                    brr_head=self.one2one_brr)
+        """One-to-one head components."""
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, periodic_head=self.one2one_periodic_cv2)
 
     @property
     def end2end(self):
@@ -144,24 +143,18 @@ class Detect(nn.Module):
         """Override the end-to-end detection mode."""
         self._end2end = value
 
-    def forward_head(self, x, box_head=None, cls_head=None, brr_head=None):
-        """Concatenate predicted boxes and class probabilities, with bounded residual refinement."""
+    def forward_head(self, x, box_head=None, cls_head=None, periodic_head=None):
+        """Concatenate and return predicted boxes (with sub-pixel residual) and class scores."""
         if box_head is None or cls_head is None:  # fused inference
             return dict()
         bs = x[0].shape[0]
-        boxes = []
-        for i in range(self.nl):
-            b = box_head[i](x[i]).view(bs, 4 * self.reg_max, -1)
-            if brr_head is not None:
-                r = brr_head[i](x[i]).view(bs, 4 * self.reg_max, -1)
-                if self.brr_act == "sin":
-                    b = b + self.brr_gain * torch.sin(r)
-                elif self.brr_act == "tanh":
-                    b = b + self.brr_gain * torch.tanh(r)
-                else:  # "linear": unbounded plain-residual control
-                    b = b + r
-            boxes.append(b)
-        boxes = torch.cat(boxes, dim=-1)
+        boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        if periodic_head is not None:
+            residual = torch.cat(
+                [periodic_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
+            )
+            # bounded, monotonic sub-pixel residual in (-0.5, 0.5) grid units
+            boxes = boxes + 0.5 * torch.sin(torch.tanh(residual) * (math.pi / 2))
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
         return dict(boxes=boxes, scores=scores, feats=x)
 
@@ -269,8 +262,8 @@ class Detect(nn.Module):
         return scores[..., None], (index % nc)[..., None].float(), idx
 
     def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.brr = None
+        """Remove the one2many head (including its periodic branch) for inference optimization."""
+        self.cv2 = self.cv3 = self.periodic_cv2 = None
 
 
 class Segment(Detect):
