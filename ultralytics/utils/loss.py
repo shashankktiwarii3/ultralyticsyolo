@@ -1297,8 +1297,7 @@ class FoveaBboxLoss(BboxLoss):
            pred_px = (pred_bboxes * stride)[fg_mask]      # (n_fg, 4) pixels
            tgt_px  = (target_bboxes * stride)[fg_mask]    # (n_fg, 4) pixels
 
-           print("pred_px range:", pred_px.min().item(), pred_px.max().item())
-           
+
            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
            nwd = wasserstein_similarity(pred_px, tgt_px, C=self.nwd_C).unsqueeze(-1)
     
@@ -1321,7 +1320,7 @@ class FoveaBboxLoss(BboxLoss):
 
 class FoveaDetectionLoss(v8DetectionLoss):
     def __init__(self, model, tal_topk=10, tal_topk2=None,
-                 use_wasserstein_assign=False, nwd_C=24.0):
+                 use_wasserstein_assign=False, nwd_C=19.0):
         super().__init__(model, tal_topk, tal_topk2)
         self.bbox_loss = FoveaBboxLoss(self.reg_max, nwd_C=nwd_C).to(self.device)  # <-- pass it
         if use_wasserstein_assign:
@@ -1332,7 +1331,7 @@ class FoveaDetectionLoss(v8DetectionLoss):
 
 
 class FoveaE2ELoss(E2ELoss):
-    def __init__(self, model, nwd_C=24.0, use_nwd_loss=True, use_wass_assign=True):
+    def __init__(self, model, nwd_C=19.0, use_nwd_loss=True, use_wass_assign=True):
         # O2M: dense teacher. Use Fovea loss only if testing (A).
         o2m_fn = FoveaDetectionLoss if use_nwd_loss else v8DetectionLoss
         super().__init__(model, loss_fn=o2m_fn)
