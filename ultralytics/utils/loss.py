@@ -1296,7 +1296,9 @@ class FoveaBboxLoss(BboxLoss):
            # Pixel-space boxes for scale-consistent NWD (inputs are grid-unit).
            pred_px = (pred_bboxes * stride)[fg_mask]      # (n_fg, 4) pixels
            tgt_px  = (target_bboxes * stride)[fg_mask]    # (n_fg, 4) pixels
-    
+
+           print("pred_px range:", pred_px.min().item(), pred_px.max().item())
+           
            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
            nwd = wasserstein_similarity(pred_px, tgt_px, C=self.nwd_C).unsqueeze(-1)
     
